@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.db
+secret.key
+setup_code.txt
+data/
