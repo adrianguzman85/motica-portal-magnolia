@@ -28,7 +28,7 @@ class Client:
             h["Content-Type"] = "application/x-www-form-urlencoded"
         c.request(method, path, body, h)
         r = c.getresponse()
-        text = r.read().decode()
+        text = r.read().decode(errors="replace")
         for k, v in r.getheaders():
             if k.lower() == "set-cookie" and v.startswith("pm_session="):
                 self.cookie = v.split(";")[0].split("=", 1)[1]
@@ -182,6 +182,82 @@ class DosEnlacesTest(unittest.TestCase):
         s, t, _ = c.req("POST", "/admin/equipos", {**base, "name": "Malo", "url_local": "javascript:alert(1)", "url": ""})
         self.assertIn("http://", t)
         self.assertNotIn("Malo", c.req("GET", "/")[1])
+
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+
+
+def post_multipart(port, cookie, path, fields, filename=None, content=b"", ctype="image/png"):
+    boundary = "----pruebaFoto123"
+    body = b""
+    for k, v in fields.items():
+        body += ("--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n" % (boundary, k, v)).encode()
+    if filename is not None:
+        body += ("--%s\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"%s\"\r\nContent-Type: %s\r\n\r\n"
+                 % (boundary, filename, ctype)).encode() + content + b"\r\n"
+    body += ("--%s--\r\n" % boundary).encode()
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    c.request("POST", path, body, {"Host": "127.0.0.1:%d" % port, "Cookie": "pm_session=" + cookie,
+                                   "Content-Type": "multipart/form-data; boundary=" + boundary})
+    r = c.getresponse()
+    return r.status, r.read().decode()
+
+
+class FotosTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.old = app.DATA_DIR
+        app.DATA_DIR = tempfile.mkdtemp()
+        app.init_data()
+        with app.db() as c:
+            c.execute("INSERT INTO users(email,name,pw,role,status,created_at) VALUES('a@x.mx','A',?,'admin','activo',1)", (app.hash_pw("contrasena-larga"),))
+            c.execute("INSERT INTO users(email,name,pw,role,status,created_at) VALUES('u@x.mx','U',?,'usuario','activo',1)", (app.hash_pw("contrasena-larga"),))
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        cls.port = cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.adm, cls.usr = Client(cls.port), Client(cls.port)
+        cls.adm.req("POST", "/entrar", {"email": "a@x.mx", "password": "contrasena-larga"})
+        cls.usr.req("POST", "/entrar", {"email": "u@x.mx", "password": "contrasena-larga"})
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        app.DATA_DIR = cls.old
+
+    def test_1_subir_y_ver_foto(self):
+        csrf = self.adm.csrf("/admin/equipos")
+        s, _ = post_multipart(self.port, self.adm.cookie, "/admin/foto", {"csrf": csrf, "id": "1", "act": "subir"}, "r.png", PNG)
+        self.assertEqual(s, 303)
+        s, body, r = self.adm.req("GET", "/foto/1")
+        self.assertEqual((s, r.getheader("Content-Type")), (200, "image/png"))
+        self.assertIn('src="/foto/1"', self.adm.req("GET", "/")[1])
+        self.assertIn('class="foto mini"', self.adm.req("GET", "/admin/equipos")[1])
+
+    def test_2_solo_imagenes(self):
+        csrf = self.adm.csrf("/admin/equipos")
+        s, t = post_multipart(self.port, self.adm.cookie, "/admin/foto", {"csrf": csrf, "id": "2", "act": "subir"},
+                              "x.svg", b"<svg onload=alert(1)></svg>", "image/svg+xml")
+        self.assertIn("Solo se aceptan imágenes", t)
+        self.assertEqual(self.adm.req("GET", "/foto/2")[0], 404)
+        s, t = post_multipart(self.port, self.adm.cookie, "/admin/foto", {"csrf": csrf, "id": "2", "act": "subir"}, "x.png",
+                              PNG + b"0" * app.MAX_PHOTO)
+        self.assertIn("más de 2 MB", t)
+
+    def test_3_permisos_por_rol(self):
+        csrf = self.adm.csrf("/admin/equipos")
+        post_multipart(self.port, self.adm.cookie, "/admin/foto", {"csrf": csrf, "id": "2", "act": "subir"}, "s.png", PNG)
+        self.assertEqual(self.usr.req("GET", "/foto/1")[0], 200)  # Riego: admin y usuario
+        self.assertEqual(self.usr.req("GET", "/foto/2")[0], 404)  # Synology: solo admin
+        ucsrf = self.usr.csrf("/cuenta")
+        s, _ = post_multipart(self.port, self.usr.cookie, "/admin/foto", {"csrf": ucsrf, "id": "1", "act": "subir"}, "m.png", PNG)
+        self.assertEqual(s, 403)
+
+    def test_4_quitar_y_csrf(self):
+        s, _ = post_multipart(self.port, self.adm.cookie, "/admin/foto", {"csrf": "falso", "id": "1", "act": "quitar"})
+        self.assertEqual(s, 403)
+        csrf = self.adm.csrf("/admin/equipos")
+        post_multipart(self.port, self.adm.cookie, "/admin/foto", {"csrf": csrf, "id": "1", "act": "quitar"})
+        self.assertEqual(self.adm.req("GET", "/foto/1")[0], 404)
 
 
 import json  # noqa: E402

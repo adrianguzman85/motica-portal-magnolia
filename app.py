@@ -37,6 +37,7 @@ MIN_PASSWORD = 10
 ROLES = ("admin", "usuario", "invitado")
 STATUSES = ("pendiente", "activo", "bloqueado")
 MAX_BODY = 20000
+MAX_PHOTO = 2 * 1024 * 1024  # bytes
 SYNC_EVERY = int(os.environ.get("SYNC_EVERY", "3600"))  # segundos; 0 = sin sincronización periódica
 DSM_URL = os.environ.get("DSM_URL", "http://127.0.0.1:5000")
 ADMIN_USERS = [u.strip().lower() for u in os.environ.get("ADMIN_USERS", "").split(",") if u.strip()]
@@ -83,6 +84,9 @@ def init_data():
             conn.execute("ALTER TABLE users ADD COLUMN role_set INTEGER NOT NULL DEFAULT 0")
         if "url_local" not in [r[1] for r in conn.execute("PRAGMA table_info(devices)")]:
             conn.execute("ALTER TABLE devices ADD COLUMN url_local TEXT NOT NULL DEFAULT ''")
+        if "photo" not in [r[1] for r in conn.execute("PRAGMA table_info(devices)")]:
+            conn.execute("ALTER TABLE devices ADD COLUMN photo BLOB")
+            conn.execute("ALTER TABLE devices ADD COLUMN photo_type TEXT NOT NULL DEFAULT ''")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_dsm ON users(dsm_user)")
         if conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0] == 0:
             conn.executemany(
@@ -286,6 +290,42 @@ def periodic_sync():
                 break
 
 
+# ---------- fotos ----------
+def sniff_image(b):
+    """Tipo de imagen por sus primeros bytes. No se aceptan SVG (pueden llevar código)."""
+    if b[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if b[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if b[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+        return "image/webp"
+    return ""
+
+
+def parse_multipart(body, ctype):
+    m = re.search(r'boundary="?([^";]+)"?', ctype or "")
+    if not m:
+        return {}, None
+    delim = b"--" + m.group(1).encode()
+    fields, upload = {}, None
+    for part in body.split(delim)[1:]:
+        if part.startswith(b"--"):
+            break
+        head, _, data = part.lstrip(b"\r\n").partition(b"\r\n\r\n")
+        data = data[:-2] if data.endswith(b"\r\n") else data
+        hdr = head.decode("latin-1")
+        name = re.search(r'name="([^"]*)"', hdr)
+        if not name:
+            continue
+        if re.search(r'filename="([^"]*)"', hdr):
+            upload = (name.group(1), data)
+        else:
+            fields[name.group(1)] = data.decode("utf-8", "replace").strip()
+    return fields, upload
+
+
 # ---------- HTML ----------
 e = html.escape
 
@@ -297,6 +337,7 @@ header{display:flex;gap:12px;align-items:center;justify-content:space-between;pa
 nav a{margin-right:14px;color:var(--ink)}main{max-width:960px;margin:0 auto;padding:16px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin:0 0 12px}
 .grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(240px,1fr))}
+.foto{width:100%;height:150px;object-fit:cover;border-radius:8px;margin-bottom:8px;display:block}.foto.mini{width:160px;height:100px}
 a.btn.alt{background:transparent;color:var(--ink);border:1px solid var(--line)}
 a.btn,button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:8px 14px;font:inherit;cursor:pointer;text-decoration:none;display:inline-block}
 button.alt{background:transparent;color:var(--ink);border:1px solid var(--line)}
@@ -435,6 +476,13 @@ class Handler(BaseHTTPRequestHandler):
         data = parse_qs(self.rfile.read(n).decode(errors="replace"), keep_blank_values=True)
         return {k: v[0].strip() for k, v in data.items()}
 
+    def multipart(self):
+        """Devuelve (campos, archivo) o (None, None) si el cuerpo excede el límite."""
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > MAX_PHOTO + 8192:
+            return None, None
+        return parse_multipart(self.rfile.read(n), self.headers.get("Content-Type", ""))
+
     def origin_ok(self):
         origin = self.headers.get("Origin")
         if not origin:
@@ -470,14 +518,21 @@ class Handler(BaseHTTPRequestHandler):
                         "Tu correo ya está registrado, pero un administrador debe activarlo.")))
                 return self.redirect("/entrar")
             if method == "POST":
-                data = self.form()
+                if path == "/admin/foto":
+                    data, upload = self.multipart()
+                    if data is not None:
+                        data["_file"] = upload
+                else:
+                    data = self.form()
                 if data is None or not hmac.compare_digest(data.get("csrf", ""), csrf):
                     return self.send(403, page("Prohibido", msg_html("Formulario no válido, recarga la página.", True), user, csrf))
             else:
                 data = {}
             if user["must_change"] and path not in ("/cuenta", "/salir"):
                 return self.redirect("/cuenta")
-            routes = {"/": self.home, "/salir": self.logout, "/cuenta": self.account,
+            if path.startswith("/foto/"):
+                return self.serve_photo(path, user, csrf)
+            routes = {"/admin/foto": self.admin_photo, "/": self.home, "/salir": self.logout, "/cuenta": self.account,
                       "/admin/usuarios": self.admin_users, "/admin/equipos": self.admin_devices,
                       "/admin/registro": self.admin_audit}
             fn = routes.get(path)
@@ -655,8 +710,9 @@ class Handler(BaseHTTPRequestHandler):
                           % (" alt" if r["url_local"] else "", e(r["url"], quote=True)))
             hint = ('<p class="mut">Local: solo en la red de Magnolia. Remoto: desde internet.</p>'
                     if r["url_local"] and r["url"] else "")
-            cards += ('<div class="card"><h3>%s</h3><p class="mut">%s</p>%s<p>%s</p></div>'
-                      % (e(r["name"]), e(r["description"]), hint, links))
+            img = '<img class="foto" src="/foto/%d" alt="" loading="lazy">' % r["id"] if r["photo"] else ""
+            cards += ('<div class="card">%s<h3>%s</h3><p class="mut">%s</p>%s<p>%s</p></div>'
+                      % (img, e(r["name"]), e(r["description"]), hint, links))
         body = '<h2>Equipos de Magnolia</h2>' + ('<div class="grid">%s</div>' % cards if cards else
                                                  '<p class="mut">No tienes equipos asignados todavía.</p>')
         return self.send(200, page("Equipos", body, user, csrf))
@@ -753,8 +809,7 @@ class Handler(BaseHTTPRequestHandler):
                 '<span class="mut">Trae usuarios nuevos y bloquea a los deshabilitados o ausentes.</span></form></div>' % e(csrf))
         return self.send(200, page("Usuarios", body, user, csrf))
 
-    def admin_devices(self, method, user, csrf, data):
-        err = ""
+    def admin_devices(self, method, user, csrf, data, err=""):
         if method == "POST":
             act = data.get("act", "")
             roles = ",".join(r for r in ROLES if data.get("r_" + r))
@@ -797,13 +852,60 @@ class Handler(BaseHTTPRequestHandler):
         for d in devs:
             cards += ('<div class="card"><form method="post" action="/admin/equipos"><input type="hidden" name="csrf" value="%s">'
                       '<input type="hidden" name="id" value="%d">%s<p><button name="act" value="guardar">Guardar</button> '
-                      '<button class="alt" name="act" value="borrar" onclick="return confirm(\'¿Borrar?\')">Borrar</button></p></form></div>'
-                      % (e(csrf), d["id"], fields(d)))
+                      '<button class="alt" name="act" value="borrar" onclick="return confirm(\'¿Borrar?\')">Borrar</button></p></form>'
+                      '<hr style="border:0;border-top:1px solid var(--line)">%s'
+                      '<form method="post" action="/admin/foto" enctype="multipart/form-data">'
+                      '<input type="hidden" name="csrf" value="%s"><input type="hidden" name="id" value="%d">'
+                      '<label>Foto del equipo (PNG, JPG, GIF o WebP, máx. 2 MB)</label>'
+                      '<input type="file" name="photo" accept="image/png,image/jpeg,image/gif,image/webp"> '
+                      '<button name="act" value="subir">Subir foto</button> '
+                      '<button class="alt" name="act" value="quitar">Quitar foto</button></form></div>'
+                      % (e(csrf), d["id"], fields(d),
+                         '<img class="foto mini" src="/foto/%d" alt="">' % d["id"] if d["photo"] else "",
+                         e(csrf), d["id"]))
         body = (msg_html(e(err), True) + "<h2>Equipos</h2>" + cards +
                 '<div class="card"><h3>Agregar equipo</h3><form method="post" action="/admin/equipos">'
                 '<input type="hidden" name="csrf" value="%s"><input type="hidden" name="act" value="crear">%s'
                 '<p><button>Agregar</button></p></form></div>' % (e(csrf), fields(None)))
         return self.send(200, page("Equipos", body, user, csrf))
+
+    def serve_photo(self, path, user, csrf):
+        did = path[len("/foto/"):]
+        r = None
+        if did.isdigit():
+            with db() as conn:
+                r = conn.execute("SELECT roles, photo, photo_type FROM devices WHERE id=?", (int(did),)).fetchone()
+        if r is None or not r["photo"] or (user["role"] != "admin" and user["role"] not in r["roles"].split(",")):
+            return self.send(404, b"no encontrada", "text/plain")
+        return self.send(200, bytes(r["photo"]), r["photo_type"] or "application/octet-stream")
+
+    def admin_photo(self, method, user, csrf, data):
+        if method != "POST":
+            return self.redirect("/admin/equipos")
+        did, err = data.get("id", ""), ""
+        if not did.isdigit():
+            err = "Equipo no válido."
+        elif data.get("act") == "quitar":
+            with db() as conn:
+                conn.execute("UPDATE devices SET photo=NULL, photo_type='' WHERE id=?", (int(did),))
+            audit(user["email"], "foto_quitada", did, self.ip())
+        else:
+            up = data.get("_file")
+            if not up or not up[1]:
+                err = "Elige una imagen."
+            elif len(up[1]) > MAX_PHOTO:
+                err = "La imagen pesa más de 2 MB."
+            else:
+                kind = sniff_image(up[1])
+                if not kind:
+                    err = "Solo se aceptan imágenes PNG, JPG, GIF o WebP."
+                else:
+                    with db() as conn:
+                        conn.execute("UPDATE devices SET photo=?, photo_type=? WHERE id=?", (up[1], kind, int(did)))
+                    audit(user["email"], "foto_subida", "equipo %s, %d bytes" % (did, len(up[1])), self.ip())
+        if err:
+            return self.admin_devices("GET", user, csrf, {}, err)
+        return self.redirect("/admin/equipos")
 
     def admin_audit(self, method, user, csrf, data):
         with db() as conn:
