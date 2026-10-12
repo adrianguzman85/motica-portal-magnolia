@@ -21,6 +21,7 @@ import secrets
 import sqlite3
 import ssl
 import sys
+import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -36,6 +37,7 @@ MIN_PASSWORD = 10
 ROLES = ("admin", "usuario", "invitado")
 STATUSES = ("pendiente", "activo", "bloqueado")
 MAX_BODY = 20000
+SYNC_EVERY = int(os.environ.get("SYNC_EVERY", "3600"))  # segundos; 0 = sin sincronización periódica
 DSM_URL = os.environ.get("DSM_URL", "http://127.0.0.1:5000")
 ADMIN_USERS = [u.strip().lower() for u in os.environ.get("ADMIN_USERS", "").split(",") if u.strip()]
 
@@ -77,6 +79,10 @@ def init_data():
         conn.executescript(SCHEMA)
         if "dsm_user" not in [r[1] for r in conn.execute("PRAGMA table_info(users)")]:
             conn.execute("ALTER TABLE users ADD COLUMN dsm_user TEXT")
+        if "role_set" not in [r[1] for r in conn.execute("PRAGMA table_info(users)")]:
+            conn.execute("ALTER TABLE users ADD COLUMN role_set INTEGER NOT NULL DEFAULT 0")
+        if "url_local" not in [r[1] for r in conn.execute("PRAGMA table_info(devices)")]:
+            conn.execute("ALTER TABLE devices ADD COLUMN url_local TEXT NOT NULL DEFAULT ''")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_dsm ON users(dsm_user)")
         if conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0] == 0:
             conn.executemany(
@@ -208,6 +214,78 @@ def dsm_list_users(sid):
     return r["data"].get("users", [])
 
 
+
+def do_sync(sid, actor, ip):
+    """Trae los usuarios del DSM con la sesión `sid`. Devuelve (nota, error).
+
+    Regla por defecto: activo en el DSM -> rol `usuario`; deshabilitado -> `invitado` y bloqueado.
+    Un rol cambiado a mano (role_set=1) no se vuelve a tocar."""
+    try:
+        users = dsm_list_users(sid)
+    except PermissionError:
+        return "", "Tu cuenta del DSM no tiene permiso para listar usuarios."
+    except Exception as exc:
+        sys.stderr.write("sync DSM: %r\n" % (exc,))
+        return "", "No se pudo hablar con el DSM."
+    now = int(time.time())
+    seen, nuevos, bloqueados, roles, activos, deshab = set(), 0, 0, 0, 0, 0
+    with db() as conn:
+        for u in users:
+            name = (u.get("name") or "").strip()
+            if not USER_RE.match(name):
+                continue
+            seen.add(name)
+            disabled = str(u.get("expired", "normal")).lower() == "now"
+            activos, deshab = activos + (not disabled), deshab + disabled
+            want = "invitado" if disabled else "usuario"
+            label = ((u.get("description") or "").strip() or name)[:80]
+            mail = (u.get("email") or "").strip().lower()
+            row = conn.execute("SELECT * FROM users WHERE dsm_user=?", (name,)).fetchone()
+            if row is None:
+                role = "admin" if name.lower() in ADMIN_USERS else want
+                state = "bloqueado" if disabled else "activo"
+                try:
+                    conn.execute("INSERT INTO users(email,name,pw,role,status,created_at,dsm_user) VALUES(?,?,?,?,?,?,?)",
+                                 (mail if valid_email(mail) else name + "@dsm", label, "x", role, state, now, name))
+                except sqlite3.IntegrityError:  # correo repetido: usar uno propio
+                    conn.execute("INSERT INTO users(email,name,pw,role,status,created_at,dsm_user) VALUES(?,?,?,?,?,?,?)",
+                                 (name + "@dsm", label, "x", role, state, now, name))
+                nuevos += 1
+                bloqueados += 1 if disabled else 0
+            else:
+                conn.execute("UPDATE users SET name=? WHERE id=?", (label, row["id"]))
+                if disabled and row["status"] == "activo":
+                    conn.execute("UPDATE users SET status='bloqueado' WHERE id=?", (row["id"],))
+                    bloqueados += 1
+                if not row["role_set"] and row["role"] not in ("admin", want):
+                    conn.execute("UPDATE users SET role=? WHERE id=?", (want, row["id"]))
+                    roles += 1
+        # Salvaguardas: una lista vacía no bloquea a nadie y los administradores nunca se bloquean por ausentes.
+        for row in (conn.execute("SELECT * FROM users WHERE dsm_user IS NOT NULL AND status='activo'").fetchall() if seen else []):
+            if row["dsm_user"] not in seen and row["dsm_user"].lower() not in ADMIN_USERS:
+                conn.execute("UPDATE users SET status='bloqueado' WHERE id=?", (row["id"],))
+                bloqueados += 1
+    audit(actor, "sync_dsm", "%d usuarios, %d nuevos, %d bloqueados, %d roles" % (len(seen), nuevos, bloqueados, roles), ip)
+    return ("Sincronizado: %d usuarios en el DSM (%d activos, %d deshabilitados). Nuevos: %d. Bloqueados ahora: %d. "
+            "Roles ajustados por defecto: %d. Los activos reciben el rol «usuario» y los deshabilitados «invitado»; "
+            "un rol cambiado a mano no se toca." % (len(seen), activos, deshab, nuevos, bloqueados, roles)), ""
+
+
+def periodic_sync():
+    """Cada SYNC_EVERY segundos sincroniza con la sesión de un administrador que siga abierta."""
+    while True:
+        time.sleep(SYNC_EVERY)
+        now = time.time()
+        for uid, (sid, exp) in list(_sids.items()):
+            if exp < now:
+                continue
+            with db() as conn:
+                adm = conn.execute("SELECT * FROM users WHERE id=? AND role='admin' AND status='activo'", (uid,)).fetchone()
+            if adm:
+                do_sync(sid, "auto", "")
+                break
+
+
 # ---------- HTML ----------
 e = html.escape
 
@@ -219,6 +297,7 @@ header{display:flex;gap:12px;align-items:center;justify-content:space-between;pa
 nav a{margin-right:14px;color:var(--ink)}main{max-width:960px;margin:0 auto;padding:16px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin:0 0 12px}
 .grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(240px,1fr))}
+a.btn.alt{background:transparent;color:var(--ink);border:1px solid var(--line)}
 a.btn,button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:8px 14px;font:inherit;cursor:pointer;text-decoration:none;display:inline-block}
 button.alt{background:transparent;color:var(--ink);border:1px solid var(--line)}
 input,select{font:inherit;padding:8px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);max-width:100%}
@@ -515,54 +594,15 @@ class Handler(BaseHTTPRequestHandler):
         with db() as conn:
             conn.execute("UPDATE users SET last_login=? WHERE id=?", (int(time.time()), u["id"]))
         audit(name, "login", "dsm", self.ip())
+        if u["role"] == "admin":  # sincroniza solo, sin esperar al botón
+            threading.Thread(target=do_sync, args=(sid, name, self.ip()), daemon=True).start()
         return self.redirect("/", cookie=self.session_token(u["id"]))
 
     def sync_dsm(self, admin):
-        """Trae los usuarios del DSM. Devuelve (nota, error)."""
         entry = _sids.get(admin["id"])
         if not entry or entry[1] < time.time():
             return "", "Vuelve a iniciar sesión para sincronizar: se necesita tu sesión del DSM."
-        try:
-            users = dsm_list_users(entry[0])
-        except PermissionError:
-            return "", "Tu cuenta del DSM no tiene permiso para listar usuarios."
-        except Exception as exc:
-            sys.stderr.write("sync DSM: %r\n" % (exc,))
-            return "", "No se pudo hablar con el DSM."
-        now = int(time.time())
-        seen, nuevos, bloqueados = set(), 0, 0
-        with db() as conn:
-            for u in users:
-                name = (u.get("name") or "").strip()
-                if not USER_RE.match(name):
-                    continue
-                seen.add(name)
-                disabled = str(u.get("expired", "normal")).lower() == "now"
-                label = ((u.get("description") or "").strip() or name)[:80]
-                mail = (u.get("email") or "").strip().lower()
-                row = conn.execute("SELECT * FROM users WHERE dsm_user=?", (name,)).fetchone()
-                if row is None:
-                    role = "admin" if name.lower() in ADMIN_USERS else "invitado"
-                    state = "bloqueado" if disabled else "activo"
-                    try:
-                        conn.execute("INSERT INTO users(email,name,pw,role,status,created_at,dsm_user) VALUES(?,?,?,?,?,?,?)",
-                                     (mail if valid_email(mail) else name + "@dsm", label, "x", role, state, now, name))
-                    except sqlite3.IntegrityError:  # correo repetido: usar uno propio
-                        conn.execute("INSERT INTO users(email,name,pw,role,status,created_at,dsm_user) VALUES(?,?,?,?,?,?,?)",
-                                     (name + "@dsm", label, "x", role, state, now, name))
-                    nuevos += 1
-                else:
-                    conn.execute("UPDATE users SET name=? WHERE id=?", (label, row["id"]))
-                    if disabled and row["status"] == "activo":
-                        conn.execute("UPDATE users SET status='bloqueado' WHERE id=?", (row["id"],))
-                        bloqueados += 1
-            for row in conn.execute("SELECT * FROM users WHERE dsm_user IS NOT NULL AND status='activo'").fetchall():
-                if row["dsm_user"] not in seen:
-                    conn.execute("UPDATE users SET status='bloqueado' WHERE id=?", (row["id"],))
-                    bloqueados += 1
-        audit(admin["dsm_user"] or admin["email"], "sync_dsm", "%d usuarios, %d nuevos, %d bloqueados" % (len(seen), nuevos, bloqueados), self.ip())
-        return ("Sincronizado: %d usuarios en el DSM, %d nuevos, %d bloqueados por estar deshabilitados o ausentes. "
-                "Los usuarios nuevos entran sin acceso a equipos hasta que les des un rol." % (len(seen), nuevos, bloqueados)), ""
+        return do_sync(entry[0], admin["dsm_user"] or admin["email"], self.ip())
 
     def signup(self, method):
         err = ok = ""
@@ -604,11 +644,19 @@ class Handler(BaseHTTPRequestHandler):
             rows = conn.execute("SELECT * FROM devices WHERE enabled=1 ORDER BY sort,name").fetchall()
         cards = ""
         for r in rows:
-            if user["role"] not in r["roles"].split(",") or not r["url"]:
+            if user["role"] not in r["roles"].split(",") or not (r["url"] or r["url_local"]):
                 continue
-            cards += ('<div class="card"><h3>%s</h3><p class="mut">%s</p>'
-                      '<a class="btn" href="%s" target="_blank" rel="noopener noreferrer">Abrir</a></div>'
-                      % (e(r["name"]), e(r["description"]), e(r["url"], quote=True)))
+            links = ""
+            if r["url_local"]:
+                links += ('<a class="btn" href="%s" target="_blank" rel="noopener noreferrer">Abrir local</a> '
+                          % e(r["url_local"], quote=True))
+            if r["url"]:
+                links += ('<a class="btn%s" href="%s" target="_blank" rel="noopener noreferrer">Abrir remoto</a>'
+                          % (" alt" if r["url_local"] else "", e(r["url"], quote=True)))
+            hint = ('<p class="mut">Local: solo en la red de Magnolia. Remoto: desde internet.</p>'
+                    if r["url_local"] and r["url"] else "")
+            cards += ('<div class="card"><h3>%s</h3><p class="mut">%s</p>%s<p>%s</p></div>'
+                      % (e(r["name"]), e(r["description"]), hint, links))
         body = '<h2>Equipos de Magnolia</h2>' + ('<div class="grid">%s</div>' % cards if cards else
                                                  '<p class="mut">No tienes equipos asignados todavía.</p>')
         return self.send(200, page("Equipos", body, user, csrf))
@@ -668,7 +716,7 @@ class Handler(BaseHTTPRequestHandler):
                     conn.execute("UPDATE users SET status='bloqueado' WHERE id=?", (target["id"],))
                     audit(user["email"], "usuario_bloqueado", target["email"], self.ip())
                 elif act == "rol" and data.get("role") in ROLES:
-                    conn.execute("UPDATE users SET role=? WHERE id=?", (data["role"], target["id"]))
+                    conn.execute("UPDATE users SET role=?, role_set=1 WHERE id=?", (data["role"], target["id"]))
                     audit(user["email"], "rol_cambiado", "%s -> %s" % (target["email"], data["role"]), self.ip())
                 elif act == "reset":
                     temp = secrets.token_urlsafe(9)
@@ -712,17 +760,19 @@ class Handler(BaseHTTPRequestHandler):
             roles = ",".join(r for r in ROLES if data.get("r_" + r))
             with db() as conn:
                 if act in ("crear", "guardar"):
-                    if not data.get("name") or not safe_url(data.get("url", "")):
-                        err = "Nombre obligatorio y la dirección debe empezar con http:// o https://."
+                    if not data.get("name") or not safe_url(data.get("url", "")) or not safe_url(data.get("url_local", "")):
+                        err = "Nombre obligatorio y las direcciones deben empezar con http:// o https://."
                     elif act == "crear":
-                        conn.execute("INSERT INTO devices(name,description,url,roles,enabled,sort) VALUES(?,?,?,?,?,?)",
+                        conn.execute("INSERT INTO devices(name,description,url,url_local,roles,enabled,sort) VALUES(?,?,?,?,?,?,?)",
                                      (data["name"][:80], data.get("description", "")[:200], data.get("url", ""),
-                                      roles, 1 if data.get("enabled") else 0, int(data.get("sort", "100") or 100)))
+                                      data.get("url_local", ""), roles, 1 if data.get("enabled") else 0,
+                                      int(data.get("sort", "100") or 100)))
                         audit(user["email"], "equipo_creado", data["name"], self.ip())
                     elif data.get("id", "").isdigit():
-                        conn.execute("UPDATE devices SET name=?,description=?,url=?,roles=?,enabled=?,sort=? WHERE id=?",
-                                     (data["name"][:80], data.get("description", "")[:200], data.get("url", ""), roles,
-                                      1 if data.get("enabled") else 0, int(data.get("sort", "100") or 100), int(data["id"])))
+                        conn.execute("UPDATE devices SET name=?,description=?,url=?,url_local=?,roles=?,enabled=?,sort=? WHERE id=?",
+                                     (data["name"][:80], data.get("description", "")[:200], data.get("url", ""),
+                                      data.get("url_local", ""), roles, 1 if data.get("enabled") else 0,
+                                      int(data.get("sort", "100") or 100), int(data["id"])))
                         audit(user["email"], "equipo_editado", data["name"], self.ip())
                 elif act == "borrar" and data.get("id", "").isdigit():
                     conn.execute("DELETE FROM devices WHERE id=?", (int(data["id"]),))
@@ -737,10 +787,11 @@ class Handler(BaseHTTPRequestHandler):
             g = (lambda k: e(str(d[k]), quote=True)) if d else (lambda k: "")
             return ('<label>Nombre</label><input name="name" value="%s" required>'
                     '<label>Descripción</label><input name="description" value="%s">'
-                    '<label>Dirección (http/https)</label><input name="url" value="%s">'
+                    '<label>Dirección local (IP de la red de Magnolia, http/https)</label><input name="url_local" value="%s">'
+                    '<label>Dirección remota (desde internet, http/https)</label><input name="url" value="%s">'
                     '<label>Orden</label><input name="sort" value="%s" size="4">%s'
                     '<label><input type="checkbox" name="enabled" value="1"%s> Visible</label>'
-                    % (g("name"), g("description"), g("url"), g("sort") if d else "100", checks,
+                    % (g("name"), g("description"), g("url_local"), g("url"), g("sort") if d else "100", checks,
                        " checked" if (d is None or d["enabled"]) else ""))
         cards = ""
         for d in devs:
@@ -771,6 +822,8 @@ def main():
     if no_users() and AUTH_MODE == "local":
         with open(os.path.join(DATA_DIR, "setup_code.txt")) as f:
             print("CODIGO DE INSTALACION: %s (abre /setup)" % f.read().strip(), flush=True)
+    if AUTH_MODE == "dsm" and SYNC_EVERY > 0:
+        threading.Thread(target=periodic_sync, daemon=True).start()
     print("Portal Magnolia en el puerto %d (modo %s)" % (PORT, AUTH_MODE), flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 

@@ -14,6 +14,9 @@ Con `AUTH_MODE=dsm` las cuentas son las del Synology:
 - **Entrada:** el portal envía usuario, contraseña y, si hace falta, el código de dos pasos a la API de autenticación del DSM (`SYNO.API.Auth`). El portal **no guarda contraseñas**. Una cuenta deshabilitada en el DSM no entra.
 - **Primer acceso:** se crea la ficha del usuario con rol `invitado`, sin acceso a ningún equipo hasta que un administrador del portal le asigne rol. Quien esté en `ADMIN_USERS` es administrador.
 - **Sincronización:** el botón «Sincronizar con el DSM» (solo administradores) lista los usuarios del DSM con la sesión del administrador (`SYNO.Core.User`), da de alta a los nuevos y **bloquea** a los deshabilitados o que ya no existen. No reactiva solo a nadie que un administrador haya bloqueado.
+- **Roles por defecto al sincronizar:** activo en el DSM → `usuario`; deshabilitado → `invitado` y bloqueado. Un rol cambiado a mano por un administrador **no se vuelve a tocar**.
+- **Sincronización automática:** se ejecuta sola cuando entra un administrador y cada `SYNC_EVERY` segundos (3600 por defecto) mientras haya una sesión de administrador abierta. No guarda contraseñas: usa esa sesión. Salvaguardas: una lista vacía del DSM no bloquea a nadie y los `ADMIN_USERS` nunca se bloquean por «ausentes».
+- **Dos enlaces por equipo:** cada equipo puede tener dirección **local** (IP de la red de Magnolia) y **remota** (nombre público); el portal muestra un botón por cada una.
 - **Variables:** `ADMIN_USERS` (usuarios del DSM separados por comas) y `DSM_URL` (por defecto `http://127.0.0.1:5000`; con la red del host de Docker funciona tal cual).
 
 ## Migración prevista a Cloudflare Access
@@ -26,6 +29,7 @@ Con `AUTH_MODE=cloudflare` el portal deja de pedir contraseña y toma el correo 
 | `PORT` | `8088` | Puerto interno |
 | `AUTH_MODE` | `local` | `local`, `dsm` o `cloudflare` |
 | `ADMIN_USERS` | vacío | Modo `dsm`: administradores del portal (usuarios del DSM) |
+| `SYNC_EVERY` | `3600` | Modo `dsm`: segundos entre sincronizaciones automáticas (0 = desactivar) |
 | `DSM_URL` | `http://127.0.0.1:5000` | Modo `dsm`: dirección del DSM visto desde el contenedor |
 
 ## Probar en local

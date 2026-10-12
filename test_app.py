@@ -142,6 +142,48 @@ class PortalTest(unittest.TestCase):
             app.AUTH_MODE = "local"
 
 
+class DosEnlacesTest(unittest.TestCase):
+    """Cada equipo puede tener enlace local y remoto; el portal muestra un botón por cada uno."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.old = app.DATA_DIR
+        app.DATA_DIR = tempfile.mkdtemp()
+        app.init_data()
+        with app.db() as c:
+            c.execute("INSERT INTO users(email,name,pw,role,status,created_at) VALUES('a@x.mx','A',?,'admin','activo',1)",
+                      (app.hash_pw("contrasena-larga"),))
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        cls.port = cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        app.DATA_DIR = cls.old
+
+    def test_dos_botones_y_validacion(self):
+        c = Client(self.port)
+        c.req("POST", "/entrar", {"email": "a@x.mx", "password": "contrasena-larga"})
+        csrf = c.csrf("/admin/equipos")
+        base = {"csrf": csrf, "act": "crear", "name": "Doble", "r_admin": "1", "enabled": "1"}
+        c.req("POST", "/admin/equipos", {**base, "url_local": "http://192.168.11.5:8081", "url": "https://remoto.x.mx"})
+        t = c.req("GET", "/")[1]
+        self.assertIn("Abrir local", t)
+        self.assertIn("Abrir remoto", t)
+        self.assertIn("http://192.168.11.5:8081", t)
+        remotos = t.count("Abrir remoto")
+        # solo local
+        c.req("POST", "/admin/equipos", {**base, "name": "Solo local", "url_local": "http://192.168.11.37", "url": ""})
+        t = c.req("GET", "/")[1]
+        self.assertIn("Solo local", t)
+        self.assertEqual(t.count("Abrir remoto"), remotos)  # el equipo "Solo local" no añade botón remoto
+        # direcciones peligrosas se rechazan
+        s, t, _ = c.req("POST", "/admin/equipos", {**base, "name": "Malo", "url_local": "javascript:alert(1)", "url": ""})
+        self.assertIn("http://", t)
+        self.assertNotIn("Malo", c.req("GET", "/")[1])
+
+
 import json  # noqa: E402
 from http.server import BaseHTTPRequestHandler  # noqa: E402
 from urllib.parse import parse_qs  # noqa: E402
@@ -252,8 +294,8 @@ class DsmModeTest(unittest.TestCase):
         s, t, _ = b.req("POST", "/admin/usuarios", {"csrf": csrf, "act": "sync"})
         self.assertIn("Sincronizado: 4 usuarios", t)
         q = lambda u: app.db().execute("SELECT status, role FROM users WHERE dsm_user=?", (u,)).fetchone()
-        self.assertEqual(tuple(q("carlos")), ("activo", "invitado"))
-        self.assertEqual(q("off")[0], "bloqueado")  # deshabilitado en el DSM
+        self.assertEqual(tuple(q("carlos")), ("activo", "usuario"))  # activo en el DSM -> usuario
+        self.assertEqual(tuple(q("off")), ("bloqueado", "invitado"))  # deshabilitado en el DSM -> invitado
         # ana desaparece del DSM -> se bloquea y su sesión deja de valer
         a, _ = self.login("ana", "pw-ana")
         FAKE_LIST[:] = [u for u in FAKE_LIST if u["name"] != "ana"]
@@ -262,9 +304,48 @@ class DsmModeTest(unittest.TestCase):
         self.assertEqual(q("ana")[0], "bloqueado")
         self.assertEqual(a.req("GET", "/")[0], 303)  # sesión caducada -> a /entrar
 
+    def test_4b_rol_manual_se_respeta(self):
+        b, _ = self.login("boss", "pw-boss")
+        csrf = b.csrf("/admin/usuarios")
+        uid = app.db().execute("SELECT id FROM users WHERE dsm_user='carlos'").fetchone()[0]
+        b.req("POST", "/admin/usuarios", {"csrf": csrf, "act": "rol", "id": uid, "role": "invitado"})
+        b.req("POST", "/admin/usuarios", {"csrf": csrf, "act": "sync"})
+        self.assertEqual(app.db().execute("SELECT role FROM users WHERE dsm_user='carlos'").fetchone()[0], "invitado")
+
+    def test_4c_sync_automatica_al_entrar_un_admin(self):
+        FAKE_LIST[:] = [
+            {"name": "boss", "email": "", "description": "Jefe", "expired": "normal"},
+            {"name": "nuevo1", "email": "n1@x.mx", "description": "Nuevo 1", "expired": "normal"},
+            {"name": "baja1", "email": "", "description": "Baja 1", "expired": "now"},
+        ]
+        self.login("boss", "pw-boss")
+        import time as _t
+        for _ in range(30):
+            if app.db().execute("SELECT 1 FROM users WHERE dsm_user='baja1'").fetchone():
+                break
+            _t.sleep(0.1)
+        q = lambda u: tuple(app.db().execute("SELECT status, role FROM users WHERE dsm_user=?", (u,)).fetchone())
+        self.assertEqual(q("nuevo1"), ("activo", "usuario"))
+        self.assertEqual(q("baja1"), ("bloqueado", "invitado"))
+
+    def test_4d_lista_vacia_no_bloquea_a_nadie(self):
+        FAKE_LIST[:] = [{"name": "boss", "email": "", "description": "Jefe", "expired": "normal"}]
+        b, _ = self.login("boss", "pw-boss")
+        import time as _t
+        _t.sleep(0.5)
+        csrf = b.csrf("/admin/usuarios")
+        FAKE_LIST[:] = []
+        b.req("POST", "/admin/usuarios", {"csrf": csrf, "act": "sync"})
+        n = app.db().execute("SELECT COUNT(*) FROM users WHERE status='activo' AND dsm_user IS NOT NULL").fetchone()[0]
+        self.assertGreaterEqual(n, 1)  # nadie fue bloqueado por una lista vacía
+        FAKE_LIST[:] = [{"name": "boss", "email": "", "description": "Jefe", "expired": "normal"}]
+        b.req("POST", "/admin/usuarios", {"csrf": csrf, "act": "sync"})  # solo boss en la lista: boss es admin y se salva
+        self.assertEqual(app.db().execute("SELECT status FROM users WHERE dsm_user='boss'").fetchone()[0], "activo")
+
     def test_5_sync_sin_permiso(self):
-        c, _ = self.login("carlos", "pw-carlos")
-        # carlos no es admin del portal: no llega a la pantalla
+        FAKE_USERS["dana"] = "pw-dana"
+        c, _ = self.login("dana", "pw-dana")
+        # dana no es admin del portal: no llega a la pantalla
         self.assertEqual(c.req("GET", "/admin/usuarios")[0], 403)
 
     def test_6_sin_setup_ni_registro(self):
