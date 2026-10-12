@@ -5,7 +5,7 @@ import re
 import tempfile
 import threading
 import unittest
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlencode
 
 TMP = tempfile.mkdtemp()
@@ -258,6 +258,176 @@ class FotosTest(unittest.TestCase):
         csrf = self.adm.csrf("/admin/equipos")
         post_multipart(self.port, self.adm.cookie, "/admin/foto", {"csrf": csrf, "id": "1", "act": "quitar"})
         self.assertEqual(self.adm.req("GET", "/foto/1")[0], 404)
+
+
+class FakeDevice(BaseHTTPRequestHandler):
+    """Un equipo de la red local: página con enlaces absolutos, cookie con Domain, redirección y eco."""
+    port = 0
+
+    def log_message(self, *a):
+        pass
+
+    def reply(self, status, body, headers=()):
+        self.send_response(status)
+        for k, v in headers:
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        origin = "http://127.0.0.1:%d" % FakeDevice.port
+        if self.path == "/redir":
+            return self.reply(302, b"", [("Location", origin + "/destino")])
+        if self.path == "/ui/":
+            return self.reply(200, b"ui", [("Content-Type", "text/plain")])
+        body = ('<a href="%s/x">x</a> host=%s ref=%s' % (origin, self.headers.get("Host"), self.headers.get("Origin", ""))).encode()
+        self.reply(200, body, [("Content-Type", "text/html"), ("Set-Cookie", "dev=1; Domain=127.0.0.1; Path=/")])
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        self.reply(200, self.rfile.read(n), [("Content-Type", "application/octet-stream")])
+
+
+def raw(port, method, path, host, cookie="", body=None, extra=None):
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    h = {"Host": host, **(extra or {})}
+    if cookie:
+        h["Cookie"] = cookie
+    c.request(method, path, body, h)
+    r = c.getresponse()
+    return r.status, r.getheaders(), r.read()
+
+
+def hdr(headers, name):
+    return [v for k, v in headers if k.lower() == name.lower()]
+
+
+class PuenteTest(unittest.TestCase):
+    PORTAL, PROXY = "magnolia.motica.test", "tablero.motica.test"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.old = (app.DATA_DIR, app.PROXY_DOMAIN, app.PORTAL_HOST)
+        app.DATA_DIR, app.PROXY_DOMAIN, app.PORTAL_HOST = tempfile.mkdtemp(), "motica.test", cls.PORTAL
+        app.init_data()
+        cls.dev = ThreadingHTTPServer(("127.0.0.1", 0), FakeDevice)
+        FakeDevice.port = cls.dev.server_address[1]
+        threading.Thread(target=cls.dev.serve_forever, daemon=True).start()
+        with app.db() as c:
+            for mail, role in (("a@x.mx", "admin"), ("u@x.mx", "usuario")):
+                c.execute("INSERT INTO users(email,name,pw,role,status,created_at) VALUES(?,?,?,?,'activo',1)",
+                          (mail, mail, app.hash_pw("contrasena-larga"), role))
+            c.execute("INSERT INTO devices(name,url_local,slug,proxy,roles,enabled,sort) VALUES('Tablero',?,'tablero',1,'admin',1,50)",
+                      ("http://127.0.0.1:%d" % FakeDevice.port,))
+            c.execute("INSERT INTO devices(name,url_local,slug,proxy,roles,enabled,sort) VALUES('Otro',?,'otro',1,'admin,usuario',1,60)",
+                      ("http://127.0.0.1:%d/ui/" % FakeDevice.port,))
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        cls.port = cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.dev.shutdown()
+        app.DATA_DIR, app.PROXY_DOMAIN, app.PORTAL_HOST = cls.old
+
+    def portal(self, mail):
+        c = Client(self.port, {"Host": self.PORTAL})
+        c.req("POST", "/entrar", {"email": mail, "password": "contrasena-larga"})
+        return c
+
+    def ticket(self, mail, slug="tablero", nxt="/"):
+        c = self.portal(mail)
+        s, _, r = c.req("GET", "/acceso?d=%s&n=%s" % (slug, nxt.replace("/", "%2F")))
+        return s, r.getheader("Location")
+
+    def cookie_for(self, mail="a@x.mx", slug="tablero", host=None):
+        host = host or self.PROXY
+        s, loc = self.ticket(mail, slug)
+        self.assertEqual(s, 303)
+        path = loc.split(host, 1)[1]
+        s, h, _ = raw(self.port, "GET", path, host)
+        self.assertEqual(s, 303)
+        return hdr(h, "Set-Cookie")[0].split(";")[0]
+
+    def test_1_sin_sesion_va_al_portal(self):
+        s, h, _ = raw(self.port, "GET", "/pagina?q=1", self.PROXY)
+        self.assertEqual(s, 303)
+        loc = hdr(h, "Location")[0]
+        self.assertTrue(loc.startswith("https://%s/acceso?d=tablero&n=" % self.PORTAL), loc)
+        self.assertIn("%2Fpagina%3Fq%3D1", loc)
+
+    def test_2_flujo_completo_y_reescritura(self):
+        ck = self.cookie_for()
+        s, h, body = raw(self.port, "GET", "/", self.PROXY, ck)
+        self.assertEqual(s, 200)
+        self.assertIn(b'href="https://tablero.motica.test/x"', body)  # dirección del equipo reescrita
+        self.assertNotIn(b"127.0.0.1:%d/x" % FakeDevice.port, body)
+        self.assertIn(("host=127.0.0.1:%d" % FakeDevice.port).encode(), body)  # el equipo ve su propio Host
+        self.assertNotIn("domain", hdr(h, "Set-Cookie")[0].lower())  # cookie sin Domain
+        s, h, _ = raw(self.port, "GET", "/redir", self.PROXY, ck)
+        self.assertEqual((s, hdr(h, "Location")[0]), (302, "https://tablero.motica.test/destino"))
+        s, _, body = raw(self.port, "POST", "/eco", self.PROXY, ck, b"hola", {"Content-Type": "text/plain"})
+        self.assertEqual((s, body), (200, b"hola"))
+
+    def test_3_el_rol_manda(self):
+        s, _ = self.ticket("u@x.mx", "tablero")  # solo admin
+        self.assertEqual(s, 403)
+        s, loc = self.ticket("u@x.mx", "otro")  # admin y usuario
+        self.assertEqual(s, 303)
+
+    def test_4_boleto_manipulado_o_de_otro_equipo(self):
+        s, loc = self.ticket("a@x.mx", "tablero")
+        path = loc.split(self.PROXY, 1)[1]
+        s, _, _ = raw(self.port, "GET", path[:-3] + "AAA", self.PROXY)
+        self.assertEqual(s, 403)
+        # un boleto del equipo «tablero» no abre «otro»
+        s, _, _ = raw(self.port, "GET", path, "otro.motica.test")
+        self.assertEqual(s, 403)
+        s, _, _ = raw(self.port, "GET", "/_pm/ticket?t=basura", self.PROXY)
+        self.assertEqual(s, 403)
+
+    def test_5_cookie_de_otro_equipo_no_sirve(self):
+        ck = self.cookie_for("a@x.mx", "tablero")
+        s, h, _ = raw(self.port, "GET", "/", "otro.motica.test", ck)
+        self.assertEqual(s, 303)  # vuelve a pedir el boleto en el portal
+
+    def test_6_direccion_inexistente_y_equipo_caido(self):
+        self.assertEqual(raw(self.port, "GET", "/", "nada.motica.test")[0], 404)
+        with app.db() as c:
+            c.execute("UPDATE devices SET url_local='http://127.0.0.1:9' WHERE slug='otro'")
+        ck = self.cookie_for("a@x.mx", "otro", "otro.motica.test")
+        s, _, body = raw(self.port, "GET", "/", "otro.motica.test", ck)
+        self.assertEqual(s, 502)
+        self.assertIn("no respondió".encode(), body)
+
+    def test_7_bloquear_al_usuario_corta_el_acceso(self):
+        ck = self.cookie_for("a@x.mx", "tablero")
+        self.assertEqual(raw(self.port, "GET", "/", self.PROXY, ck)[0], 200)
+        with app.db() as c:
+            c.execute("UPDATE users SET status='bloqueado' WHERE email='a@x.mx'")
+        try:
+            self.assertEqual(raw(self.port, "GET", "/", self.PROXY, ck)[0], 303)
+        finally:
+            with app.db() as c:
+                c.execute("UPDATE users SET status='activo' WHERE email='a@x.mx'")
+
+    def test_8_login_regresa_al_equipo(self):
+        c = Client(self.port, {"Host": self.PORTAL})
+        s, _, r = c.req("GET", "/acceso?d=tablero&n=%2F")
+        self.assertEqual((s, r.getheader("Location")), (303, "/entrar"))
+        nxt = [v for k, v in r.getheaders() if k.lower() == "set-cookie"][0].split(";")[0]
+        s, _, r = c.req("POST", "/entrar", {"email": "a@x.mx", "password": "contrasena-larga"}, {"Cookie": nxt})
+        self.assertEqual(s, 303)
+        self.assertTrue(r.getheader("Location").startswith("/acceso?d=tablero"), r.getheader("Location"))
+
+    def test_9_redireccion_abierta_y_metodos(self):
+        s, loc = self.ticket("a@x.mx", "tablero", "//evil.com")
+        path = loc.split(self.PROXY, 1)[1]
+        s, h, _ = raw(self.port, "GET", path, self.PROXY)
+        self.assertEqual((s, hdr(h, "Location")[0]), (303, "/"))  # //evil.com se descarta
+        self.assertEqual(raw(self.port, "DELETE", "/", self.PORTAL)[0], 405)
 
 
 import json  # noqa: E402

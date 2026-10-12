@@ -19,6 +19,17 @@ Con `AUTH_MODE=dsm` las cuentas son las del Synology:
 - **Dos enlaces por equipo:** cada equipo puede tener dirección **local** (IP de la red de Magnolia) y **remota** (nombre público); el portal muestra un botón por cada una.
 - **Variables:** `ADMIN_USERS` (usuarios del DSM separados por comas) y `DSM_URL` (por defecto `http://127.0.0.1:5000`; con la red del host de Docker funciona tal cual).
 
+## Acceso remoto a equipos de la red local (puente)
+Un equipo con **dirección local** y la casilla «Acceso remoto por el portal» se abre desde internet en `https://<nombre>.<PROXY_DOMAIN>` (por ejemplo `https://medidores.motica.mx`), sin instalar nada en el celular y sin dejar el equipo publicado:
+1. Quien abre esa dirección sin sesión es enviado al portal (`/acceso`), que pide el inicio de sesión (usuario del DSM y dos pasos).
+2. Si su rol permite ese equipo, el portal le da un **boleto firmado de 60 segundos** y lo devuelve a la dirección del equipo, que lo cambia por una cookie propia de ese equipo (8 horas, solo para ese equipo).
+3. Cada petición revisa que la cookie sea válida, que el usuario siga activo y que su rol siga permitiendo el equipo. Si se bloquea al usuario, pierde el acceso al instante.
+4. El portal reenvía la petición a la dirección local (reescribe `Host`, `Origin`, `Referer`, `Location`, cookies y direcciones absolutas del equipo). Cada equipo vive en su propio origen, así que su página no puede tocar el portal.
+
+Limitaciones: no reenvía WebSocket; límite de 25 MB por respuesta; reescribe solo texto (HTML, JS, CSS, JSON, XML); si el equipo usa otra dirección absoluta dentro de su código JavaScript, puede no funcionar. Requiere un registro DNS comodín (`*.motica.mx`) hacia el túnel que apunte al portal.
+
+Variables: `PROXY_DOMAIN` (por ejemplo `motica.mx`; vacío desactiva el puente) y `PORTAL_HOST` (por ejemplo `magnolia.motica.mx`).
+
 ## Migración prevista a Cloudflare Access
 Con `AUTH_MODE=cloudflare` el portal deja de pedir contraseña y toma el correo de la cabecera `Cf-Access-Authenticated-User-Email`. Los correos nuevos quedan «pendientes» hasta que un administrador los activa y les da rol. **Antes de usarlo** el puerto del portal solo debe alcanzarse a través del túnel con Access delante (si no, la cabecera se podría falsificar) y conviene validar el JWT `Cf-Access-Jwt-Assertion`.
 

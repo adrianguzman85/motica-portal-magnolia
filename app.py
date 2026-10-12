@@ -14,6 +14,7 @@ import base64
 import hashlib
 import hmac
 import html
+import http.client
 import json
 import os
 import re
@@ -23,9 +24,10 @@ import ssl
 import sys
 import threading
 import time
+import unicodedata
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 PORT = int(os.environ.get("PORT", "8088"))
@@ -38,6 +40,13 @@ ROLES = ("admin", "usuario", "invitado")
 STATUSES = ("pendiente", "activo", "bloqueado")
 MAX_BODY = 20000
 MAX_PHOTO = 2 * 1024 * 1024  # bytes
+PROXY_DOMAIN = os.environ.get("PROXY_DOMAIN", "").strip().lower().lstrip(".")  # p. ej. motica.mx; vacío = sin puente
+PORTAL_HOST = os.environ.get("PORTAL_HOST", "").strip().lower()  # p. ej. magnolia.motica.mx
+PROXY_MAX = 25 * 1024 * 1024
+RESERVED_SLUGS = {"magnolia", "synology", "riego", "app", "www", "tesla", "mail", "admin", "api"}
+SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$")
+HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers",
+       "transfer-encoding", "upgrade", "content-length"}
 SYNC_EVERY = int(os.environ.get("SYNC_EVERY", "3600"))  # segundos; 0 = sin sincronización periódica
 DSM_URL = os.environ.get("DSM_URL", "http://127.0.0.1:5000")
 ADMIN_USERS = [u.strip().lower() for u in os.environ.get("ADMIN_USERS", "").split(",") if u.strip()]
@@ -87,6 +96,17 @@ def init_data():
         if "photo" not in [r[1] for r in conn.execute("PRAGMA table_info(devices)")]:
             conn.execute("ALTER TABLE devices ADD COLUMN photo BLOB")
             conn.execute("ALTER TABLE devices ADD COLUMN photo_type TEXT NOT NULL DEFAULT ''")
+        if "slug" not in [r[1] for r in conn.execute("PRAGMA table_info(devices)")]:
+            conn.execute("ALTER TABLE devices ADD COLUMN slug TEXT NOT NULL DEFAULT ''")
+            conn.execute("ALTER TABLE devices ADD COLUMN proxy INTEGER NOT NULL DEFAULT 0")
+        used = {r[0] for r in conn.execute("SELECT slug FROM devices WHERE slug!=''")}
+        for r in conn.execute("SELECT id,name FROM devices WHERE slug=''").fetchall():
+            base = slugify(r["name"])
+            cand, n = base, 2
+            while cand in used or cand in RESERVED_SLUGS:
+                cand, n = "%s-%d" % (base, n), n + 1
+            used.add(cand)
+            conn.execute("UPDATE devices SET slug=? WHERE id=?", (cand, r["id"]))
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_dsm ON users(dsm_user)")
         if conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0] == 0:
             conn.executemany(
@@ -290,6 +310,12 @@ def periodic_sync():
                 break
 
 
+def slugify(text):
+    t = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().lower()
+    t = re.sub(r"[^a-z0-9]+", "-", t).strip("-")[:40].strip("-")
+    return t or "equipo"
+
+
 # ---------- fotos ----------
 def sniff_image(b):
     """Tipo de imagen por sus primeros bytes. No se aceptan SVG (pueden llevar código)."""
@@ -408,7 +434,7 @@ class Handler(BaseHTTPRequestHandler):
     def secure(self):
         return self.headers.get("X-Forwarded-Proto", "") == "https" or os.environ.get("COOKIE_SECURE") == "1"
 
-    def send(self, status, body, ctype="text/html; charset=utf-8", cookie=None, location=None):
+    def send(self, status, body, ctype="text/html; charset=utf-8", cookie=None, location=None, headers=None):
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -422,11 +448,28 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Set-Cookie", "pm_session=%s%s%s" % (cookie, flags, "; Max-Age=0" if cookie == "" else "; Max-Age=%d" % SESSION_TTL))
         if location:
             self.send_header("Location", location)
+        for k, v in (headers or []):
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
-    def redirect(self, where, cookie=None):
-        self.send(303, b"", location=where, cookie=cookie)
+    def redirect(self, where, cookie=None, headers=None):
+        self.send(303, b"", location=where, cookie=cookie, headers=headers)
+
+    def get_cookie(self, name):
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == name:
+                return v
+        return ""
+
+    def after_login(self, uid):
+        """Tras entrar vuelve a /acceso si venía de abrir un equipo remoto; si no, al inicio."""
+        nxt = self.get_cookie("pm_next")
+        nxt = unquote(nxt) if nxt else ""
+        if nxt.startswith("/acceso?"):
+            return self.redirect(nxt, cookie=self.session_token(uid), headers=[("Set-Cookie", "pm_next=; Path=/; Max-Age=0")])
+        return self.redirect("/", cookie=self.session_token(uid))
 
     def cookie_value(self):
         for part in (self.headers.get("Cookie") or "").split(";"):
@@ -496,11 +539,25 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self.route("POST")
 
+    def do_PUT(self):
+        self.route("PUT")
+
+    def do_DELETE(self):
+        self.route("DELETE")
+
+    def do_HEAD(self):
+        self.route("HEAD")
+
     def route(self, method):
         path = urlparse(self.path).path
         try:
             if path == "/salud":
                 return self.send(200, b"ok", "text/plain")
+            host = (self.headers.get("Host") or "").split(":")[0].lower()
+            if PROXY_DOMAIN and host.endswith("." + PROXY_DOMAIN) and host != PORTAL_HOST:
+                return self.proxy_request(method, host)
+            if method not in ("GET", "POST"):
+                return self.send(405, page("No permitido", msg_html("Método no permitido.", True)))
             if method == "POST" and not self.origin_ok():
                 return self.send(403, page("Prohibido", msg_html("Origen no permitido.", True)))
             if path == "/setup":
@@ -516,6 +573,10 @@ class Handler(BaseHTTPRequestHandler):
                 if AUTH_MODE == "cloudflare":
                     return self.send(403, page("Acceso pendiente", msg_html(
                         "Tu correo ya está registrado, pero un administrador debe activarlo.")))
+                if path == "/acceso":  # viene de abrir un equipo remoto: recordar a dónde volver
+                    return self.send(303, b"", location="/entrar", headers=[(
+                        "Set-Cookie", "pm_next=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=600%s" % (
+                            quote(self.path, safe=""), "; Secure" if self.secure() else ""))])
                 return self.redirect("/entrar")
             if method == "POST":
                 if path == "/admin/foto":
@@ -532,7 +593,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.redirect("/cuenta")
             if path.startswith("/foto/"):
                 return self.serve_photo(path, user, csrf)
-            routes = {"/admin/foto": self.admin_photo, "/": self.home, "/salir": self.logout, "/cuenta": self.account,
+            routes = {"/acceso": self.acceso, "/admin/foto": self.admin_photo, "/": self.home, "/salir": self.logout, "/cuenta": self.account,
                       "/admin/usuarios": self.admin_users, "/admin/equipos": self.admin_devices,
                       "/admin/registro": self.admin_audit}
             fn = routes.get(path)
@@ -606,7 +667,7 @@ class Handler(BaseHTTPRequestHandler):
         with db() as conn:
             conn.execute("UPDATE users SET last_login=? WHERE id=?", (int(time.time()), u["id"]))
         audit(mail, "login", "", self.ip())
-        return self.redirect("/", cookie=self.session_token(u["id"]))
+        return self.after_login(u["id"])
 
     def login_dsm(self, method):
         if method == "GET":
@@ -651,7 +712,7 @@ class Handler(BaseHTTPRequestHandler):
         audit(name, "login", "dsm", self.ip())
         if u["role"] == "admin":  # sincroniza solo, sin esperar al botón
             threading.Thread(target=do_sync, args=(sid, name, self.ip()), daemon=True).start()
-        return self.redirect("/", cookie=self.session_token(u["id"]))
+        return self.after_login(u["id"])
 
     def sync_dsm(self, admin):
         entry = _sids.get(admin["id"])
@@ -705,11 +766,12 @@ class Handler(BaseHTTPRequestHandler):
             if r["url_local"]:
                 links += ('<a class="btn" href="%s" target="_blank" rel="noopener noreferrer">Abrir local</a> '
                           % e(r["url_local"], quote=True))
-            if r["url"]:
+            remote = r["url"] or (("https://%s.%s" % (r["slug"], PROXY_DOMAIN)) if (r["proxy"] and PROXY_DOMAIN and r["url_local"]) else "")
+            if remote:
                 links += ('<a class="btn%s" href="%s" target="_blank" rel="noopener noreferrer">Abrir remoto</a>'
-                          % (" alt" if r["url_local"] else "", e(r["url"], quote=True)))
+                          % (" alt" if r["url_local"] else "", e(remote, quote=True)))
             hint = ('<p class="mut">Local: solo en la red de Magnolia. Remoto: desde internet.</p>'
-                    if r["url_local"] and r["url"] else "")
+                    if r["url_local"] and remote else "")
             img = '<img class="foto" src="/foto/%d" alt="" loading="lazy">' % r["id"] if r["photo"] else ""
             cards += ('<div class="card">%s<h3>%s</h3><p class="mut">%s</p>%s<p>%s</p></div>'
                       % (img, e(r["name"]), e(r["description"]), hint, links))
@@ -815,19 +877,28 @@ class Handler(BaseHTTPRequestHandler):
             roles = ",".join(r for r in ROLES if data.get("r_" + r))
             with db() as conn:
                 if act in ("crear", "guardar"):
+                    slug = (data.get("slug") or slugify(data.get("name", ""))).strip().lower()
+                    proxy = 1 if data.get("proxy") else 0
+                    did = int(data["id"]) if data.get("id", "").isdigit() else 0
                     if not data.get("name") or not safe_url(data.get("url", "")) or not safe_url(data.get("url_local", "")):
                         err = "Nombre obligatorio y las direcciones deben empezar con http:// o https://."
+                    elif not SLUG_RE.match(slug) or slug in RESERVED_SLUGS:
+                        err = "El nombre de la dirección remota no es válido o está reservado (minúsculas, números y guiones)."
+                    elif conn.execute("SELECT 1 FROM devices WHERE slug=? AND id!=?", (slug, did)).fetchone():
+                        err = "Ya hay otro equipo con ese nombre de dirección remota."
+                    elif proxy and not data.get("url_local"):
+                        err = "El acceso remoto por el portal necesita la dirección local del equipo."
                     elif act == "crear":
-                        conn.execute("INSERT INTO devices(name,description,url,url_local,roles,enabled,sort) VALUES(?,?,?,?,?,?,?)",
+                        conn.execute("INSERT INTO devices(name,description,url,url_local,slug,proxy,roles,enabled,sort) VALUES(?,?,?,?,?,?,?,?,?)",
                                      (data["name"][:80], data.get("description", "")[:200], data.get("url", ""),
-                                      data.get("url_local", ""), roles, 1 if data.get("enabled") else 0,
+                                      data.get("url_local", ""), slug, proxy, roles, 1 if data.get("enabled") else 0,
                                       int(data.get("sort", "100") or 100)))
                         audit(user["email"], "equipo_creado", data["name"], self.ip())
-                    elif data.get("id", "").isdigit():
-                        conn.execute("UPDATE devices SET name=?,description=?,url=?,url_local=?,roles=?,enabled=?,sort=? WHERE id=?",
+                    elif did:
+                        conn.execute("UPDATE devices SET name=?,description=?,url=?,url_local=?,slug=?,proxy=?,roles=?,enabled=?,sort=? WHERE id=?",
                                      (data["name"][:80], data.get("description", "")[:200], data.get("url", ""),
-                                      data.get("url_local", ""), roles, 1 if data.get("enabled") else 0,
-                                      int(data.get("sort", "100") or 100), int(data["id"])))
+                                      data.get("url_local", ""), slug, proxy, roles, 1 if data.get("enabled") else 0,
+                                      int(data.get("sort", "100") or 100), did))
                         audit(user["email"], "equipo_editado", data["name"], self.ip())
                 elif act == "borrar" and data.get("id", "").isdigit():
                     conn.execute("DELETE FROM devices WHERE id=?", (int(data["id"]),))
@@ -842,12 +913,15 @@ class Handler(BaseHTTPRequestHandler):
             g = (lambda k: e(str(d[k]), quote=True)) if d else (lambda k: "")
             return ('<label>Nombre</label><input name="name" value="%s" required>'
                     '<label>Descripción</label><input name="description" value="%s">'
-                    '<label>Dirección local (IP de la red de Magnolia, http/https)</label><input name="url_local" value="%s">'
-                    '<label>Dirección remota (desde internet, http/https)</label><input name="url" value="%s">'
+                    '<label>Dirección local (IP de la red de Magnolia, con puerto si hace falta, http/https)</label><input name="url_local" value="%s">'
+                    '<label>Dirección remota propia (opcional, http/https)</label><input name="url" value="%s">'
+                    '<label><input type="checkbox" name="proxy" value="1"%s> Acceso remoto por el portal (reenvía a la dirección local)</label>'
+                    '<label>Nombre en la dirección remota del portal (minúsculas, números y guiones)</label><input name="slug" value="%s">'
                     '<label>Orden</label><input name="sort" value="%s" size="4">%s'
                     '<label><input type="checkbox" name="enabled" value="1"%s> Visible</label>'
-                    % (g("name"), g("description"), g("url_local"), g("url"), g("sort") if d else "100", checks,
-                       " checked" if (d is None or d["enabled"]) else ""))
+                    % (g("name"), g("description"), g("url_local"), g("url"),
+                       " checked" if (d is not None and d["proxy"]) else "", g("slug"),
+                       g("sort") if d else "100", checks, " checked" if (d is None or d["enabled"]) else ""))
         cards = ""
         for d in devs:
             cards += ('<div class="card"><form method="post" action="/admin/equipos"><input type="hidden" name="csrf" value="%s">'
@@ -868,6 +942,147 @@ class Handler(BaseHTTPRequestHandler):
                 '<input type="hidden" name="csrf" value="%s"><input type="hidden" name="act" value="crear">%s'
                 '<p><button>Agregar</button></p></form></div>' % (e(csrf), fields(None)))
         return self.send(200, page("Equipos", body, user, csrf))
+
+    # -- puente a equipos de la red local --
+    def may_open(self, user, dev):
+        return user["role"] == "admin" or user["role"] in dev["roles"].split(",")
+
+    def proxy_device(self, slug):
+        with db() as conn:
+            return conn.execute("SELECT * FROM devices WHERE slug=? AND proxy=1 AND enabled=1 AND url_local!=''", (slug,)).fetchone()
+
+    def acceso(self, method, user, csrf, data):
+        """En el portal: entrega un boleto de 60 segundos para abrir un equipo remoto."""
+        q = parse_qs(urlparse(self.path).query)
+        dev = self.proxy_device(q.get("d", [""])[0])
+        nxt = q.get("n", ["/"])[0]
+        if not PROXY_DOMAIN or dev is None or not self.may_open(user, dev):
+            return self.send(403, page("Sin acceso", msg_html("No tienes acceso a ese equipo o no existe.", True), user, csrf))
+        if not nxt.startswith("/") or nxt.startswith("//"):
+            nxt = "/"
+        payload = "tk:%d:%d:%d:%s" % (user["id"], dev["id"], int(time.time()) + 60, base64.urlsafe_b64encode(nxt.encode()).decode())
+        token = base64.urlsafe_b64encode(payload.encode()).decode() + "." + sign(payload)
+        audit(user["dsm_user"] or user["email"], "acceso_remoto", dev["name"], self.ip())
+        return self.redirect("https://%s.%s/_pm/ticket?t=%s" % (dev["slug"], PROXY_DOMAIN, quote(token, safe="")))
+
+    def proxy_request(self, method, host):
+        slug = host[:-len(PROXY_DOMAIN) - 1]
+        dev = self.proxy_device(slug)
+        if dev is None:
+            return self.send(404, page("No encontrado", msg_html("Esta dirección no existe.", True)))
+        sp = urlparse(self.path)
+        if sp.path == "/_pm/ticket":
+            return self.proxy_ticket(dev, parse_qs(sp.query).get("t", [""])[0])
+        if self.proxy_user(dev) is None:
+            return self.redirect("https://%s/acceso?d=%s&n=%s" % (PORTAL_HOST, quote(slug), quote(self.path, safe="")))
+        return self.proxy_forward(method, dev, host)
+
+    def proxy_ticket(self, dev, token):
+        try:
+            b64, sig = token.split(".")
+            payload = base64.urlsafe_b64decode(b64.encode()).decode()
+            if not hmac.compare_digest(sig, sign(payload)):
+                raise ValueError("firma")
+            kind, uid, did, exp, nb = payload.split(":")
+            if kind != "tk" or int(did) != dev["id"] or int(exp) < time.time():
+                raise ValueError("boleto")
+            nxt = base64.urlsafe_b64decode(nb.encode()).decode()
+        except Exception:
+            return self.send(403, page("Enlace vencido", msg_html("El enlace de acceso venció. Vuelve a entrar desde el portal.", True)))
+        if not nxt.startswith("/") or nxt.startswith("//"):
+            nxt = "/"
+        val = "px:%d:%d:%d" % (int(uid), dev["id"], int(time.time()) + SESSION_TTL)
+        cookie = base64.urlsafe_b64encode(val.encode()).decode() + "." + sign(val)
+        flags = "; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d%s" % (SESSION_TTL, "; Secure" if self.secure() else "")
+        return self.send(303, b"", location=nxt, headers=[("Set-Cookie", "pm_proxy=%s%s" % (cookie, flags))])
+
+    def proxy_user(self, dev):
+        try:
+            b64, sig = self.get_cookie("pm_proxy").split(".")
+            payload = base64.urlsafe_b64decode(b64.encode()).decode()
+            if not hmac.compare_digest(sig, sign(payload)):
+                return None
+            kind, uid, did, exp = payload.split(":")
+            if kind != "px" or int(did) != dev["id"] or int(exp) < time.time():
+                return None
+            with db() as conn:
+                u = conn.execute("SELECT * FROM users WHERE id=?", (int(uid),)).fetchone()
+        except Exception:
+            return None
+        if u is None or u["status"] != "activo" or not self.may_open(u, dev):
+            return None
+        return u
+
+    def proxy_forward(self, method, dev, host):
+        base = urlparse(dev["url_local"])
+        if base.scheme not in ("http", "https") or not base.hostname:
+            return self.send(502, page("Error", msg_html("La dirección local del equipo no es válida.", True)))
+        if "upgrade" in (self.headers.get("Connection", "") + " " + self.headers.get("Upgrade", "")).lower():
+            return self.send(501, page("No disponible", msg_html(
+                "Este equipo usa una conexión continua (WebSocket) que el portal no puede reenviar.", True)))
+        if self.path == "/" and base.path not in ("", "/"):
+            return self.redirect(base.path)
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > PROXY_MAX:
+            return self.send(413, page("Muy grande", msg_html("La petición es demasiado grande.", True)))
+        body = self.rfile.read(length) if length else None
+        origin_in, origin_out = "https://" + host, "%s://%s" % (base.scheme, base.netloc)
+        hdrs = {}
+        for k, v in self.headers.items():
+            lk = k.lower()
+            if lk in HOP or lk in ("host", "accept-encoding") or lk.startswith(("cf-", "x-forwarded", "cdn-loop")):
+                continue
+            if lk == "cookie":
+                v = "; ".join(p for p in v.split("; ") if not p.startswith("pm_proxy="))
+                if not v:
+                    continue
+            if lk in ("origin", "referer"):
+                v = v.replace(origin_in, origin_out)
+            hdrs[k] = v
+        hdrs["Accept-Encoding"] = "identity"
+        hdrs["Host"] = base.netloc
+        if body is not None:
+            hdrs["Content-Length"] = str(len(body))
+        try:
+            if base.scheme == "https":
+                conn = http.client.HTTPSConnection(base.hostname, base.port or 443, timeout=20, context=DSM_CTX)
+            else:
+                conn = http.client.HTTPConnection(base.hostname, base.port or 80, timeout=20)
+            conn.request(method, self.path, body, hdrs)
+            resp = conn.getresponse()
+            data = resp.read(PROXY_MAX + 1)
+            if len(data) > PROXY_MAX:
+                raise ValueError("respuesta demasiado grande")
+            heads, status, reason = resp.getheaders(), resp.status, resp.reason
+            conn.close()
+        except Exception as exc:
+            sys.stderr.write("puente %s: %r\n" % (dev["slug"], exc))
+            return self.send(502, page("No responde", msg_html(
+                "El equipo no respondió. Revisa que esté encendido y que la dirección local y el puerto sean correctos.", True)))
+        ctype, encoded, out = "", False, []
+        for k, v in heads:
+            lk = k.lower()
+            if lk == "content-type":
+                ctype = v
+            if lk == "content-encoding" and v.lower() != "identity":
+                encoded = True
+            if lk in HOP or lk == "strict-transport-security":
+                continue
+            if lk == "location":
+                v = v.replace(origin_out, origin_in)
+            if lk == "set-cookie":
+                v = re.sub(r";\s*domain=[^;]*", "", v, flags=re.I)
+            out.append((k, v))
+        if not encoded and any(t in ctype.lower() for t in ("text/html", "javascript", "css", "json", "xml")):
+            data = data.replace(origin_out.encode(), origin_in.encode())
+        self.send_response(status, reason)
+        for k, v in out:
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
+        if method != "HEAD" and status not in (204, 304):
+            self.wfile.write(data)
 
     def serve_photo(self, path, user, csrf):
         did = path[len("/foto/"):]
