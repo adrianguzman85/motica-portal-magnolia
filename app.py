@@ -5,6 +5,8 @@ Solo usa la biblioteca estándar de Python (sin pip). Los datos viven en DATA_DI
 (portal.db, secret.key, setup_code.txt); esa carpeta es la que se monta como volumen
 en Docker. Dos modos de acceso (AUTH_MODE):
   local       usuarios y contraseñas propios (PBKDF2), registro con aprobación.
+  dsm         las cuentas son las del Synology (DSM): el portal valida usuario y
+              contraseña contra su API y sincroniza la lista de usuarios.
   cloudflare  la identidad llega en la cabecera de Cloudflare Access; el portal solo
               asigna rol y equipos. Es la migración prevista.
 """
@@ -12,13 +14,17 @@ import base64
 import hashlib
 import hmac
 import html
+import json
 import os
+import re
 import secrets
 import sqlite3
+import ssl
 import sys
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 PORT = int(os.environ.get("PORT", "8088"))
@@ -30,6 +36,8 @@ MIN_PASSWORD = 10
 ROLES = ("admin", "usuario", "invitado")
 STATUSES = ("pendiente", "activo", "bloqueado")
 MAX_BODY = 20000
+DSM_URL = os.environ.get("DSM_URL", "http://127.0.0.1:5000")
+ADMIN_USERS = [u.strip().lower() for u in os.environ.get("ADMIN_USERS", "").split(",") if u.strip()]
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
@@ -53,6 +61,7 @@ SEED_DEVICES = (
 )
 
 _fails = {}
+_sids = {}  # id de usuario -> (sid del DSM, vencimiento); solo en memoria
 
 
 # ---------- utilidades ----------
@@ -66,6 +75,9 @@ def init_data():
     os.makedirs(DATA_DIR, exist_ok=True)
     with db() as conn:
         conn.executescript(SCHEMA)
+        if "dsm_user" not in [r[1] for r in conn.execute("PRAGMA table_info(users)")]:
+            conn.execute("ALTER TABLE users ADD COLUMN dsm_user TEXT")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_dsm ON users(dsm_user)")
         if conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0] == 0:
             conn.executemany(
                 "INSERT INTO devices(name,description,url,roles,enabled,sort) VALUES(?,?,?,?,?,?)",
@@ -76,7 +88,7 @@ def init_data():
         with os.fdopen(fd, "w") as f:
             f.write(secrets.token_hex(32))
     code = os.path.join(DATA_DIR, "setup_code.txt")
-    if no_users() and not os.path.exists(code):
+    if AUTH_MODE == "local" and no_users() and not os.path.exists(code):
         fd = os.open(code, os.O_WRONLY | os.O_CREAT, 0o600)
         with os.fdopen(fd, "w") as f:
             f.write(secrets.token_hex(4))
@@ -150,6 +162,52 @@ def safe_url(u):
     return u == "" or u.startswith("http://") or u.startswith("https://")
 
 
+# ---------- DSM ----------
+USER_RE = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
+DSM_CTX = ssl.create_default_context()
+DSM_CTX.check_hostname = False  # el DSM usa un certificado propio y se le habla en local
+DSM_CTX.verify_mode = ssl.CERT_NONE
+
+
+def dsm_call(path, params):
+    req = urllib.request.Request(DSM_URL.rstrip("/") + path, data=urlencode(params).encode())
+    with urllib.request.urlopen(req, timeout=10, context=DSM_CTX) as r:
+        return json.loads(r.read().decode())
+
+
+def dsm_login(username, password, otp=""):
+    """Devuelve (sid, "") si entra, o (None, código de error del DSM)."""
+    params = {"api": "SYNO.API.Auth", "version": "3", "method": "login", "account": username,
+              "passwd": password, "session": "PortalMagnolia", "format": "sid"}
+    if otp:
+        params["otp_code"] = otp
+    try:
+        r = dsm_call("/webapi/auth.cgi", params)
+    except Exception as exc:
+        sys.stderr.write("DSM no responde: %r\n" % (exc,))
+        return None, "sin_respuesta"
+    if r.get("success"):
+        return r["data"]["sid"], ""
+    return None, str(r.get("error", {}).get("code", ""))
+
+
+def dsm_logout(sid):
+    try:
+        dsm_call("/webapi/auth.cgi", {"api": "SYNO.API.Auth", "version": "1", "method": "logout",
+                                      "session": "PortalMagnolia", "_sid": sid})
+    except Exception:
+        pass
+
+
+def dsm_list_users(sid):
+    r = dsm_call("/webapi/entry.cgi", {"api": "SYNO.Core.User", "version": "1", "method": "list",
+                                       "type": "local", "offset": "0", "limit": "-1",
+                                       "additional": '["email","description","expired"]', "_sid": sid})
+    if not r.get("success"):
+        raise PermissionError(str(r.get("error", {}).get("code", "")))
+    return r["data"].get("users", [])
+
+
 # ---------- HTML ----------
 e = html.escape
 
@@ -179,7 +237,7 @@ def page(title, body, user=None, csrf=""):
             links += '<a href="/admin/usuarios">Usuarios</a><a href="/admin/equipos">Gestionar equipos</a><a href="/admin/registro">Registro</a>'
         links += '<a href="/cuenta">Mi cuenta</a>'
         out = ""
-        if AUTH_MODE == "local":
+        if AUTH_MODE in ("local", "dsm"):
             out = '<form class="inline" method="post" action="/salir"><input type="hidden" name="csrf" value="%s"><button class="alt">Salir</button></form>' % e(csrf)
         nav = "<nav>%s</nav><span class='mut'>%s (%s) %s</span>" % (links, e(user["name"]), e(user["role"]), out)
     return ("<!doctype html><html lang='es'><head><meta charset='utf-8'>"
@@ -200,6 +258,17 @@ def form_login(error=""):
 <label>Correo</label><input name="email" type="email" required autocomplete="username">
 <label>Contraseña</label><input name="password" type="password" required autocomplete="current-password">
 <p><button>Entrar</button></p></form>%s</div>""" % reg)
+
+
+def form_login_dsm(error="", otp=False, username=""):
+    extra = ('<label>Código de verificación en dos pasos</label>'
+             '<input name="otp" inputmode="numeric" autocomplete="one-time-code" autofocus>') if otp else ""
+    return page("Entrar", msg_html(e(error), True) + """
+<div class="card"><h2>Entrar</h2><p class="mut">Usa tu usuario y contraseña del Synology.</p>
+<form method="post" action="/entrar">
+<label>Usuario</label><input name="username" value="%s" required autocomplete="username">
+<label>Contraseña</label><input name="password" type="password" required autocomplete="current-password">%s
+<p><button>Entrar</button></p></form></div>""" % (e(username, quote=True), extra))
 
 
 # ---------- servidor ----------
@@ -311,7 +380,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.page_setup(method)
             if no_users() and AUTH_MODE == "local":
                 return self.redirect("/setup")
-            if path == "/entrar" and AUTH_MODE == "local":
+            if path == "/entrar" and AUTH_MODE in ("local", "dsm"):
                 return self.login(method)
             if path == "/registro" and AUTH_MODE == "local":
                 return self.signup(method)
@@ -344,7 +413,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- páginas --
     def page_setup(self, method):
-        if not no_users():
+        if AUTH_MODE != "local" or not no_users():
             return self.redirect("/")
         with open(os.path.join(DATA_DIR, "setup_code.txt")) as f:
             code = f.read().strip()
@@ -377,6 +446,8 @@ class Handler(BaseHTTPRequestHandler):
 <p><button>Crear administrador</button></p></form></div>""" % (MIN_PASSWORD, MIN_PASSWORD)))
 
     def login(self, method):
+        if AUTH_MODE == "dsm":
+            return self.login_dsm(method)
         if method == "GET":
             return self.send(200, form_login())
         d = self.form() or {}
@@ -402,6 +473,96 @@ class Handler(BaseHTTPRequestHandler):
             conn.execute("UPDATE users SET last_login=? WHERE id=?", (int(time.time()), u["id"]))
         audit(mail, "login", "", self.ip())
         return self.redirect("/", cookie=self.session_token(u["id"]))
+
+    def login_dsm(self, method):
+        if method == "GET":
+            return self.send(200, form_login_dsm())
+        d = self.form() or {}
+        name = d.get("username", "")
+        key = "login:%s:%s" % (self.ip(), name.lower())
+        if locked(key):
+            return self.send(429, form_login_dsm("Demasiados intentos. Espera 15 minutos.", username=name))
+        if not USER_RE.match(name) or not d.get("password"):
+            register_fail(key)
+            return self.send(401, form_login_dsm("Usuario o contraseña incorrectos.", username=name))
+        sid, code = dsm_login(name, d["password"], d.get("otp", ""))
+        if sid is None:
+            if code in ("403", "404", "406") and not d.get("otp"):
+                return self.send(200, form_login_dsm("Escribe el código de verificación en dos pasos.", True, name))
+            if code == "sin_respuesta":
+                return self.send(503, form_login_dsm("No se pudo hablar con el Synology. Intenta de nuevo.", username=name))
+            register_fail(key)
+            audit(name, "login_fallido", "dsm:%s" % code, self.ip())
+            msg = {"401": "Tu cuenta del Synology está deshabilitada.", "404": "Código de verificación incorrecto."}.get(
+                code, "Usuario o contraseña incorrectos.")
+            return self.send(401, form_login_dsm(msg, code == "404", name))
+        with db() as conn:
+            u = conn.execute("SELECT * FROM users WHERE dsm_user=?", (name,)).fetchone()
+            if u is None:
+                role = "admin" if name.lower() in ADMIN_USERS else "invitado"
+                conn.execute("INSERT INTO users(email,name,pw,role,status,created_at,dsm_user) VALUES(?,?,?,?,?,?,?)",
+                             (name + "@dsm", name, "x", role, "activo", int(time.time()), name))
+                u = conn.execute("SELECT * FROM users WHERE dsm_user=?", (name,)).fetchone()
+            elif name.lower() in ADMIN_USERS and u["role"] != "admin":
+                conn.execute("UPDATE users SET role='admin' WHERE id=?", (u["id"],))
+                u = conn.execute("SELECT * FROM users WHERE dsm_user=?", (name,)).fetchone()
+        if u["status"] != "activo":
+            dsm_logout(sid)
+            audit(name, "login_bloqueado", u["status"], self.ip())
+            return self.send(403, form_login_dsm("Tu acceso al portal está bloqueado. Habla con un administrador.", username=name))
+        clear_fails(key)
+        _sids[u["id"]] = (sid, time.time() + SESSION_TTL)
+        with db() as conn:
+            conn.execute("UPDATE users SET last_login=? WHERE id=?", (int(time.time()), u["id"]))
+        audit(name, "login", "dsm", self.ip())
+        return self.redirect("/", cookie=self.session_token(u["id"]))
+
+    def sync_dsm(self, admin):
+        """Trae los usuarios del DSM. Devuelve (nota, error)."""
+        entry = _sids.get(admin["id"])
+        if not entry or entry[1] < time.time():
+            return "", "Vuelve a iniciar sesión para sincronizar: se necesita tu sesión del DSM."
+        try:
+            users = dsm_list_users(entry[0])
+        except PermissionError:
+            return "", "Tu cuenta del DSM no tiene permiso para listar usuarios."
+        except Exception as exc:
+            sys.stderr.write("sync DSM: %r\n" % (exc,))
+            return "", "No se pudo hablar con el DSM."
+        now = int(time.time())
+        seen, nuevos, bloqueados = set(), 0, 0
+        with db() as conn:
+            for u in users:
+                name = (u.get("name") or "").strip()
+                if not USER_RE.match(name):
+                    continue
+                seen.add(name)
+                disabled = str(u.get("expired", "normal")).lower() == "now"
+                label = ((u.get("description") or "").strip() or name)[:80]
+                mail = (u.get("email") or "").strip().lower()
+                row = conn.execute("SELECT * FROM users WHERE dsm_user=?", (name,)).fetchone()
+                if row is None:
+                    role = "admin" if name.lower() in ADMIN_USERS else "invitado"
+                    state = "bloqueado" if disabled else "activo"
+                    try:
+                        conn.execute("INSERT INTO users(email,name,pw,role,status,created_at,dsm_user) VALUES(?,?,?,?,?,?,?)",
+                                     (mail if valid_email(mail) else name + "@dsm", label, "x", role, state, now, name))
+                    except sqlite3.IntegrityError:  # correo repetido: usar uno propio
+                        conn.execute("INSERT INTO users(email,name,pw,role,status,created_at,dsm_user) VALUES(?,?,?,?,?,?,?)",
+                                     (name + "@dsm", label, "x", role, state, now, name))
+                    nuevos += 1
+                else:
+                    conn.execute("UPDATE users SET name=? WHERE id=?", (label, row["id"]))
+                    if disabled and row["status"] == "activo":
+                        conn.execute("UPDATE users SET status='bloqueado' WHERE id=?", (row["id"],))
+                        bloqueados += 1
+            for row in conn.execute("SELECT * FROM users WHERE dsm_user IS NOT NULL AND status='activo'").fetchall():
+                if row["dsm_user"] not in seen:
+                    conn.execute("UPDATE users SET status='bloqueado' WHERE id=?", (row["id"],))
+                    bloqueados += 1
+        audit(admin["dsm_user"] or admin["email"], "sync_dsm", "%d usuarios, %d nuevos, %d bloqueados" % (len(seen), nuevos, bloqueados), self.ip())
+        return ("Sincronizado: %d usuarios en el DSM, %d nuevos, %d bloqueados por estar deshabilitados o ausentes. "
+                "Los usuarios nuevos entran sin acceso a equipos hasta que les des un rol." % (len(seen), nuevos, bloqueados)), ""
 
     def signup(self, method):
         err = ok = ""
@@ -432,6 +593,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def logout(self, method, user, csrf, data):
         audit(user["email"], "salida", "", self.ip())
+        if AUTH_MODE == "dsm":
+            entry = _sids.pop(user["id"], None)
+            if entry:
+                dsm_logout(entry[0])
         return self.redirect("/entrar", cookie="")
 
     def home(self, method, user, csrf, data):
@@ -490,6 +655,8 @@ class Handler(BaseHTTPRequestHandler):
                             audit(user["email"], "usuario_creado", "%s (%s)" % (mail, role), self.ip())
                         except sqlite3.IntegrityError:
                             err = "Ese correo ya existe."
+                elif act == "sync" and AUTH_MODE == "dsm":
+                    note, err = self.sync_dsm(user)
                 elif target is None:
                     err = "Usuario no encontrado."
                 elif target["id"] == user["id"] and act in ("bloquear", "rol"):
@@ -531,6 +698,11 @@ class Handler(BaseHTTPRequestHandler):
                 '<input type="hidden" name="csrf" value="%s"><input type="hidden" name="act" value="crear">'
                 '<label>Nombre</label><input name="name" required><label>Correo</label><input name="email" type="email" required>'
                 '<label>Rol</label><select name="role">%s</select><p><button>Crear</button></p></form></div>' % (rows, e(csrf), opts))
+        if AUTH_MODE == "dsm":
+            body = body.split('<div class="card"><h3>Crear usuario')[0] + (
+                '<div class="card"><form method="post" action="/admin/usuarios"><input type="hidden" name="csrf" value="%s">'
+                '<input type="hidden" name="act" value="sync"><button>Sincronizar con el DSM</button> '
+                '<span class="mut">Trae usuarios nuevos y bloquea a los deshabilitados o ausentes.</span></form></div>' % e(csrf))
         return self.send(200, page("Usuarios", body, user, csrf))
 
     def admin_devices(self, method, user, csrf, data):
@@ -594,6 +766,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     init_data()
+    if AUTH_MODE == "dsm" and not ADMIN_USERS:
+        print("AVISO: define ADMIN_USERS (usuarios del DSM que administran el portal)", flush=True)
     if no_users() and AUTH_MODE == "local":
         with open(os.path.join(DATA_DIR, "setup_code.txt")) as f:
             print("CODIGO DE INSTALACION: %s (abre /setup)" % f.read().strip(), flush=True)

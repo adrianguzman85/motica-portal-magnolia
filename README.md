@@ -9,6 +9,13 @@ Portal web para la red de Magnolia: registro de equipos (riego, Synology, medido
 - **Seguridad:** contraseñas con PBKDF2-SHA256 (600 000 iteraciones), bloqueo de 15 min tras 5 intentos, cookie de sesión firmada (HttpOnly, SameSite, Secure tras HTTPS), token CSRF y revisión de `Origin` en cada formulario, cabeceras de seguridad, texto escapado.
 - **Instalación inicial:** al primer arranque se genera un código de un solo uso que se imprime en el log del contenedor; con él se crea el primer administrador en `/setup`.
 
+## Modo DSM (recomendado en Magnolia)
+Con `AUTH_MODE=dsm` las cuentas son las del Synology:
+- **Entrada:** el portal envía usuario, contraseña y, si hace falta, el código de dos pasos a la API de autenticación del DSM (`SYNO.API.Auth`). El portal **no guarda contraseñas**. Una cuenta deshabilitada en el DSM no entra.
+- **Primer acceso:** se crea la ficha del usuario con rol `invitado`, sin acceso a ningún equipo hasta que un administrador del portal le asigne rol. Quien esté en `ADMIN_USERS` es administrador.
+- **Sincronización:** el botón «Sincronizar con el DSM» (solo administradores) lista los usuarios del DSM con la sesión del administrador (`SYNO.Core.User`), da de alta a los nuevos y **bloquea** a los deshabilitados o que ya no existen. No reactiva solo a nadie que un administrador haya bloqueado.
+- **Variables:** `ADMIN_USERS` (usuarios del DSM separados por comas) y `DSM_URL` (por defecto `http://127.0.0.1:5000`; con la red del host de Docker funciona tal cual).
+
 ## Migración prevista a Cloudflare Access
 Con `AUTH_MODE=cloudflare` el portal deja de pedir contraseña y toma el correo de la cabecera `Cf-Access-Authenticated-User-Email`. Los correos nuevos quedan «pendientes» hasta que un administrador los activa y les da rol. **Antes de usarlo** el puerto del portal solo debe alcanzarse a través del túnel con Access delante (si no, la cabecera se podría falsificar) y conviene validar el JWT `Cf-Access-Jwt-Assertion`.
 
@@ -17,7 +24,9 @@ Con `AUTH_MODE=cloudflare` el portal deja de pedir contraseña y toma el correo 
 |---|---|---|
 | `DATA_DIR` | `/data` | Carpeta con `portal.db`, `secret.key` y `setup_code.txt` (hacer respaldo) |
 | `PORT` | `8088` | Puerto interno |
-| `AUTH_MODE` | `local` | `local` o `cloudflare` |
+| `AUTH_MODE` | `local` | `local`, `dsm` o `cloudflare` |
+| `ADMIN_USERS` | vacío | Modo `dsm`: administradores del portal (usuarios del DSM) |
+| `DSM_URL` | `http://127.0.0.1:5000` | Modo `dsm`: dirección del DSM visto desde el contenedor |
 
 ## Probar en local
 ```bash

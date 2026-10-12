@@ -142,5 +142,136 @@ class PortalTest(unittest.TestCase):
             app.AUTH_MODE = "local"
 
 
+import json  # noqa: E402
+from http.server import BaseHTTPRequestHandler  # noqa: E402
+from urllib.parse import parse_qs  # noqa: E402
+
+FAKE_USERS = {"boss": "pw-boss", "ana": "pw-ana", "otto": "pw-otto", "carlos": "pw-carlos", "off": "pw-off"}
+FAKE_OTP = {"otto": "123456"}
+FAKE_DISABLED = {"off"}
+FAKE_LIST = []
+
+
+class FakeDSM(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def reply(self, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        p = {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode()).items()}
+        if self.path == "/webapi/auth.cgi" and p.get("method") == "login":
+            acc = p.get("account")
+            if acc not in FAKE_USERS or FAKE_USERS[acc] != p.get("passwd"):
+                return self.reply({"success": False, "error": {"code": 400}})
+            if acc in FAKE_DISABLED:
+                return self.reply({"success": False, "error": {"code": 401}})
+            if acc in FAKE_OTP:
+                if not p.get("otp_code"):
+                    return self.reply({"success": False, "error": {"code": 403}})
+                if p["otp_code"] != FAKE_OTP[acc]:
+                    return self.reply({"success": False, "error": {"code": 404}})
+            return self.reply({"success": True, "data": {"sid": "sid-" + acc}})
+        if self.path == "/webapi/auth.cgi":
+            return self.reply({"success": True})
+        if self.path == "/webapi/entry.cgi" and p.get("method") == "list":
+            if p.get("_sid") != "sid-boss":
+                return self.reply({"success": False, "error": {"code": 105}})
+            return self.reply({"success": True, "data": {"users": FAKE_LIST, "total": len(FAKE_LIST)}})
+        self.reply({"success": False, "error": {"code": 103}})
+
+
+class DsmModeTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.dsm = ThreadingHTTPServer(("127.0.0.1", 0), FakeDSM)
+        threading.Thread(target=cls.dsm.serve_forever, daemon=True).start()
+        cls.old = (app.AUTH_MODE, app.DSM_URL, app.ADMIN_USERS, app.DATA_DIR)
+        app.DATA_DIR = tempfile.mkdtemp()
+        app.AUTH_MODE, app.DSM_URL, app.ADMIN_USERS = "dsm", "http://127.0.0.1:%d" % cls.dsm.server_address[1], ["boss"]
+        app.init_data()
+        cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        cls.port = cls.srv.server_address[1]
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.dsm.shutdown()
+        app.AUTH_MODE, app.DSM_URL, app.ADMIN_USERS, app.DATA_DIR = cls.old
+
+    def login(self, user, pw, otp=None):
+        c = Client(self.port)
+        data = {"username": user, "password": pw}
+        if otp:
+            data["otp"] = otp
+        return c, c.req("POST", "/entrar", data)
+
+    def test_1_login_y_roles(self):
+        c, (s, _, _) = self.login("ana", "pw-ana")
+        self.assertEqual(s, 303)
+        self.assertIn("No tienes equipos", c.req("GET", "/")[1])  # invitado sin equipos
+        self.assertEqual(c.req("GET", "/admin/usuarios")[0], 403)
+        b, (s, _, _) = self.login("boss", "pw-boss")
+        self.assertEqual(s, 303)
+        self.assertIn("Riego", b.req("GET", "/")[1])  # admin por ADMIN_USERS
+        self.assertEqual(app.db().execute("SELECT role FROM users WHERE dsm_user='boss'").fetchone()[0], "admin")
+
+    def test_2_errores_de_dsm(self):
+        self.assertEqual(self.login("ana", "mala")[1][0], 401)
+        s, t, _ = self.login("off", "pw-off")[1]
+        self.assertEqual(s, 401)
+        self.assertIn("deshabilitada", t)
+        self.assertEqual(self.login("no;existe", "x")[1][0], 401)  # nombre con caracteres no válidos
+
+    def test_3_dos_pasos(self):
+        c, (s, t, _) = self.login("otto", "pw-otto")
+        self.assertEqual(s, 200)
+        self.assertIn("verificación", t)
+        self.assertEqual(self.login("otto", "pw-otto", "000000")[1][0], 401)
+        self.assertEqual(self.login("otto", "pw-otto", "123456")[1][0], 303)
+
+    def test_4_sincronizacion(self):
+        FAKE_LIST[:] = [
+            {"name": "boss", "email": "boss@x.mx", "description": "Jefe", "expired": "normal"},
+            {"name": "ana", "email": "ana@x.mx", "description": "Ana", "expired": "normal"},
+            {"name": "carlos", "email": "carlos@x.mx", "description": "Carlos", "expired": "normal"},
+            {"name": "off", "email": "", "description": "Baja", "expired": "now"},
+        ]
+        b, _ = self.login("boss", "pw-boss")
+        page_ = b.req("GET", "/admin/usuarios")[1]
+        self.assertIn("Sincronizar con el DSM", page_)
+        self.assertNotIn("Crear usuario", page_)
+        csrf = b.csrf("/admin/usuarios")
+        s, t, _ = b.req("POST", "/admin/usuarios", {"csrf": csrf, "act": "sync"})
+        self.assertIn("Sincronizado: 4 usuarios", t)
+        q = lambda u: app.db().execute("SELECT status, role FROM users WHERE dsm_user=?", (u,)).fetchone()
+        self.assertEqual(tuple(q("carlos")), ("activo", "invitado"))
+        self.assertEqual(q("off")[0], "bloqueado")  # deshabilitado en el DSM
+        # ana desaparece del DSM -> se bloquea y su sesión deja de valer
+        a, _ = self.login("ana", "pw-ana")
+        FAKE_LIST[:] = [u for u in FAKE_LIST if u["name"] != "ana"]
+        csrf = b.csrf("/admin/usuarios")
+        s, t, _ = b.req("POST", "/admin/usuarios", {"csrf": csrf, "act": "sync"})
+        self.assertEqual(q("ana")[0], "bloqueado")
+        self.assertEqual(a.req("GET", "/")[0], 303)  # sesión caducada -> a /entrar
+
+    def test_5_sync_sin_permiso(self):
+        c, _ = self.login("carlos", "pw-carlos")
+        # carlos no es admin del portal: no llega a la pantalla
+        self.assertEqual(c.req("GET", "/admin/usuarios")[0], 403)
+
+    def test_6_sin_setup_ni_registro(self):
+        c = Client(self.port)
+        self.assertEqual(c.req("GET", "/setup")[0], 303)
+        self.assertEqual(c.req("GET", "/registro")[0], 303)  # sin sesión -> /entrar
+
+
 if __name__ == "__main__":
     unittest.main()
