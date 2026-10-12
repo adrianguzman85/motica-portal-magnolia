@@ -30,6 +30,9 @@ Limitaciones: no reenvía WebSocket; límite de 25 MB por respuesta; reescribe s
 
 Variables: `PROXY_DOMAIN` (por ejemplo `motica.mx`; vacío desactiva el puente) y `PORTAL_HOST` (por ejemplo `magnolia.motica.mx`).
 
+## Fotos por equipo
+Cada equipo puede tener una foto (PNG, JPG, GIF o WebP, máx. 2 MB; no se aceptan SVG). Se sube como archivo o se pega la dirección de una imagen de internet: el portal la **descarga una sola vez** y la guarda en `/data` (no depende del sitio original). La descarga solo acepta `https://`, exige que el nombre resuelva únicamente a direcciones públicas (rechaza red local, `localhost` y direcciones internas), se conecta a la IP ya validada, no sigue redirecciones y verifica el tipo por el contenido. Solo administradores.
+
 ## Migración prevista a Cloudflare Access
 Con `AUTH_MODE=cloudflare` el portal deja de pedir contraseña y toma el correo de la cabecera `Cf-Access-Authenticated-User-Email`. Los correos nuevos quedan «pendientes» hasta que un administrador los activa y les da rol. **Antes de usarlo** el puerto del portal solo debe alcanzarse a través del túnel con Access delante (si no, la cabecera se podría falsificar) y conviene validar el JWT `Cf-Access-Jwt-Assertion`.
 

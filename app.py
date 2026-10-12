@@ -15,10 +15,12 @@ import hashlib
 import hmac
 import html
 import http.client
+import ipaddress
 import json
 import os
 import re
 import secrets
+import socket
 import sqlite3
 import ssl
 import sys
@@ -330,6 +332,46 @@ def sniff_image(b):
     return ""
 
 
+def fetch_image(url):
+    """Descarga una imagen de internet de forma segura. Devuelve (bytes, tipo) o lanza ValueError.
+
+    Solo https; el nombre debe resolver únicamente a direcciones públicas (nada de la red local,
+    localhost ni direcciones internas); se conecta a la IP ya validada; sin redirecciones; máx. 2 MB."""
+    u = urlparse((url or "").strip())
+    if u.scheme != "https" or not u.hostname or u.username or u.password:
+        raise ValueError("La dirección debe empezar con https://")
+    port = u.port or 443
+    try:
+        infos = socket.getaddrinfo(u.hostname, port, proto=socket.IPPROTO_TCP)
+    except OSError:
+        raise ValueError("No se encontró esa dirección en internet.")
+    ips = sorted({i[4][0] for i in infos})
+    if not ips or any(not ipaddress.ip_address(ip).is_global for ip in ips):
+        raise ValueError("Esa dirección no es pública. Solo se aceptan imágenes de internet.")
+    try:
+        sock = socket.create_connection((ips[0], port), timeout=10)
+        ssock = ssl.create_default_context().wrap_socket(sock, server_hostname=u.hostname)
+        conn = http.client.HTTPSConnection(u.hostname, port, timeout=10)
+        conn.sock = ssock
+        conn.request("GET", (u.path or "/") + ("?" + u.query if u.query else ""),
+                     headers={"User-Agent": "Mozilla/5.0 PortalMagnolia", "Accept": "image/*"})
+        resp = conn.getresponse()
+        if resp.status != 200:
+            raise ValueError("El sitio respondió %d (no se siguen redirecciones)." % resp.status)
+        data = resp.read(MAX_PHOTO + 1)
+        conn.close()
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("No se pudo descargar la imagen (%s)." % exc.__class__.__name__)
+    if len(data) > MAX_PHOTO:
+        raise ValueError("La imagen pesa más de 2 MB.")
+    kind = sniff_image(data)
+    if not kind:
+        raise ValueError("Solo se aceptan imágenes PNG, JPG, GIF o WebP.")
+    return data, kind
+
+
 def parse_multipart(body, ctype):
     m = re.search(r'boundary="?([^";]+)"?', ctype or "")
     if not m:
@@ -363,7 +405,7 @@ header{display:flex;gap:12px;align-items:center;justify-content:space-between;pa
 nav a{margin-right:14px;color:var(--ink)}main{max-width:960px;margin:0 auto;padding:16px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin:0 0 12px}
 .grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(240px,1fr))}
-.foto{width:100%;height:150px;object-fit:cover;border-radius:8px;margin-bottom:8px;display:block}.foto.mini{width:160px;height:100px}
+.foto{width:100%;height:150px;object-fit:contain;background:#fff;border-radius:8px;margin-bottom:8px;display:block}.foto.mini{width:160px;height:100px}
 a.btn.alt{background:transparent;color:var(--ink);border:1px solid var(--line)}
 a.btn,button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:8px 14px;font:inherit;cursor:pointer;text-decoration:none;display:inline-block}
 button.alt{background:transparent;color:var(--ink);border:1px solid var(--line)}
@@ -933,7 +975,10 @@ class Handler(BaseHTTPRequestHandler):
                       '<label>Foto del equipo (PNG, JPG, GIF o WebP, máx. 2 MB)</label>'
                       '<input type="file" name="photo" accept="image/png,image/jpeg,image/gif,image/webp"> '
                       '<button name="act" value="subir">Subir foto</button> '
-                      '<button class="alt" name="act" value="quitar">Quitar foto</button></form></div>'
+                      '<button class="alt" name="act" value="quitar">Quitar foto</button>'
+                      '<label>…o la dirección de una imagen de internet (https://…)</label>'
+                      '<input name="photo_url" placeholder="https://" size="40"> '
+                      '<button name="act" value="url">Descargar foto</button></form></div>'
                       % (e(csrf), d["id"], fields(d),
                          '<img class="foto mini" src="/foto/%d" alt="">' % d["id"] if d["photo"] else "",
                          e(csrf), d["id"]))
@@ -1109,6 +1154,15 @@ class Handler(BaseHTTPRequestHandler):
             with db() as conn:
                 conn.execute("UPDATE devices SET photo=NULL, photo_type='' WHERE id=?", (int(did),))
             audit(user["email"], "foto_quitada", did, self.ip())
+        elif data.get("act") == "url":
+            try:
+                blob, kind = fetch_image(data.get("photo_url", ""))
+            except ValueError as exc:
+                err = str(exc)
+            else:
+                with db() as conn:
+                    conn.execute("UPDATE devices SET photo=?, photo_type=? WHERE id=?", (blob, kind, int(did)))
+                audit(user["email"], "foto_desde_url", "equipo %s, %s" % (did, urlparse(data["photo_url"]).hostname), self.ip())
         else:
             up = data.get("_file")
             if not up or not up[1]:

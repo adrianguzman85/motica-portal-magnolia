@@ -444,6 +444,42 @@ class PuenteTest(unittest.TestCase):
         self.assertEqual(raw(self.port, "DELETE", "/", self.PORTAL)[0], 405)
 
 
+class FotoUrlTest(unittest.TestCase):
+    def test_direcciones_no_permitidas(self):
+        for url in ("http://example.com/a.png", "https://127.0.0.1/a.png", "https://localhost/a.png",
+                    "https://192.168.11.37/a.png", "https://10.0.0.5/a.png", "https://169.254.169.254/latest",
+                    "https://[::1]/a.png", "ftp://example.com/a.png", "https://user:pw@example.com/a.png", "", "no es url"):
+            with self.assertRaises(ValueError, msg=url):
+                app.fetch_image(url)
+
+    def test_flujo_admin_con_descarga(self):
+        old = (app.DATA_DIR, app.fetch_image)
+        app.DATA_DIR = tempfile.mkdtemp()
+        app.init_data()
+        with app.db() as c:
+            c.execute("INSERT INTO users(email,name,pw,role,status,created_at) VALUES('a@x.mx','A',?,'admin','activo',1)", (app.hash_pw("contrasena-larga"),))
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            c = Client(port)
+            c.req("POST", "/entrar", {"email": "a@x.mx", "password": "contrasena-larga"})
+            csrf = c.csrf("/admin/equipos")
+            app.fetch_image = lambda url: (PNG, "image/png")
+            s, _ = post_multipart(port, c.cookie, "/admin/foto", {"csrf": csrf, "id": "1", "act": "url", "photo_url": "https://ejemplo.mx/a.png"})
+            self.assertEqual(s, 303)
+            self.assertEqual(c.req("GET", "/foto/1")[0], 200)
+            def malo(url):
+                raise ValueError("Esa dirección no es pública.")
+            app.fetch_image = malo
+            s, t = post_multipart(port, c.cookie, "/admin/foto", {"csrf": csrf, "id": "2", "act": "url", "photo_url": "https://192.168.1.1/x"})
+            self.assertIn("no es pública", t)
+            self.assertEqual(c.req("GET", "/foto/2")[0], 404)
+        finally:
+            srv.shutdown()
+            app.DATA_DIR, app.fetch_image = old
+
+
 import json  # noqa: E402
 from http.server import BaseHTTPRequestHandler  # noqa: E402
 from urllib.parse import parse_qs  # noqa: E402
