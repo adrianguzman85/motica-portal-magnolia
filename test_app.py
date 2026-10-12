@@ -281,6 +281,14 @@ class FakeDevice(BaseHTTPRequestHandler):
             return self.reply(302, b"", [("Location", origin + "/destino")])
         if self.path == "/ui/":
             return self.reply(200, b"ui", [("Content-Type", "text/plain")])
+        if self.path == "/corto":  # declara 100 bytes y envía 10 (como algunos equipos reales)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", "100")
+            self.end_headers()
+            self.wfile.write(b"0123456789")
+            self.close_connection = True
+            return
         body = ('<a href="%s/x">x</a> host=%s ref=%s' % (origin, self.headers.get("Host"), self.headers.get("Origin", ""))).encode()
         self.reply(200, body, [("Content-Type", "text/html"), ("Set-Cookie", "dev=1; Domain=127.0.0.1; Path=/")])
 
@@ -371,6 +379,12 @@ class PuenteTest(unittest.TestCase):
         s, _, body = raw(self.port, "POST", "/eco", self.PROXY, ck, b"hola", {"Content-Type": "text/plain"})
         self.assertEqual((s, body), (200, b"hola"))
 
+    def test_2b_respuesta_cortada_del_equipo(self):
+        ck = self.cookie_for()
+        s, h, body = raw(self.port, "GET", "/corto", self.PROXY, ck)
+        self.assertEqual((s, body), (200, b"0123456789"))
+        self.assertEqual(hdr(h, "Content-Length"), ["10"])  # largo corregido
+
     def test_3_el_rol_manda(self):
         s, _ = self.ticket("u@x.mx", "tablero")  # solo admin
         self.assertEqual(s, 403)
@@ -399,7 +413,7 @@ class PuenteTest(unittest.TestCase):
             c.execute("UPDATE devices SET url_local='http://127.0.0.1:9' WHERE slug='otro'")
         ck = self.cookie_for("a@x.mx", "otro", "otro.motica.test")
         s, _, body = raw(self.port, "GET", "/", "otro.motica.test", ck)
-        self.assertEqual(s, 502)
+        self.assertEqual(s, 503)
         self.assertIn("no respondió".encode(), body)
 
     def test_7_bloquear_al_usuario_corta_el_acceso(self):

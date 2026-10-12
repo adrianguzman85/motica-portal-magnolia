@@ -1016,7 +1016,7 @@ class Handler(BaseHTTPRequestHandler):
     def proxy_forward(self, method, dev, host):
         base = urlparse(dev["url_local"])
         if base.scheme not in ("http", "https") or not base.hostname:
-            return self.send(502, page("Error", msg_html("La dirección local del equipo no es válida.", True)))
+            return self.send(503, page("Error", msg_html("La dirección local del equipo no es válida.", True)))
         if "upgrade" in (self.headers.get("Connection", "") + " " + self.headers.get("Upgrade", "")).lower():
             return self.send(501, page("No disponible", msg_html(
                 "Este equipo usa una conexión continua (WebSocket) que el portal no puede reenviar.", True)))
@@ -1050,14 +1050,19 @@ class Handler(BaseHTTPRequestHandler):
                 conn = http.client.HTTPConnection(base.hostname, base.port or 80, timeout=20)
             conn.request(method, self.path, body, hdrs)
             resp = conn.getresponse()
-            data = resp.read(PROXY_MAX + 1)
+            try:
+                data = resp.read(PROXY_MAX + 1)
+            except http.client.IncompleteRead as exc:  # equipos que declaran más bytes de los que envían
+                data = exc.partial
             if len(data) > PROXY_MAX:
                 raise ValueError("respuesta demasiado grande")
             heads, status, reason = resp.getheaders(), resp.status, resp.reason
             conn.close()
+            sys.stderr.write("puente %s: %s %s -> %d %s %dB\n" % (
+                dev["slug"], method, self.path[:80], status, resp.getheader("Content-Type", "?"), len(data)))
         except Exception as exc:
             sys.stderr.write("puente %s: %r\n" % (dev["slug"], exc))
-            return self.send(502, page("No responde", msg_html(
+            return self.send(503, page("No responde", msg_html(
                 "El equipo no respondió. Revisa que esté encendido y que la dirección local y el puerto sean correctos.", True)))
         ctype, encoded, out = "", False, []
         for k, v in heads:
